@@ -1,10 +1,10 @@
-// src/rust_core/character_core.rs
-
 use crate::vec2::Vec2;
+use crate::vec2::saturated_add;
 use crate::world_core::WorldCore;
 use crate::collision::Collision;
 use crate::netobj::{NetObjCharacterCore, PlayerInput};
-pub const PHYS_SIZE: f32 = 28.0;
+use super::constants::*;
+use super::helpers::{round_to_int, velocity_ramp};
 
 pub struct CharacterCore<'a> {
     pub world: Option<&'a WorldCore>,
@@ -34,22 +34,18 @@ impl<'a> CharacterCore<'a> {
         Self {
             world: None,
             collision: None,
-
             pos: Vec2::zero(),
             vel: Vec2::zero(),
-
             hook_drag_vel: Vec2::zero(),
             hook_pos: Vec2::zero(),
             hook_dir: Vec2::zero(),
             hook_tick: 0,
             hook_state: 0,
             hooked_player: -1,
-
             jumped: 0,
             direction: 0,
             angle: 0,
             death: false,
-
             input: PlayerInput::default(),
             triggered_events: 0,
         }
@@ -76,7 +72,7 @@ impl<'a> CharacterCore<'a> {
 
     pub fn add_drag_velocity(&mut self) {
         if let Some(world) = self.world {
-            let ds = world.tuning().hook_drag_speed;
+            let ds = world.tuning.hook_drag_speed;
             self.vel.x = saturated_add(-ds, ds, self.vel.x, self.hook_drag_vel.x);
             self.vel.y = saturated_add(-ds, ds, self.vel.y, self.hook_drag_vel.y);
         }
@@ -89,19 +85,14 @@ impl<'a> CharacterCore<'a> {
     pub fn write_netobj(&self, out: &mut NetObjCharacterCore) {
         out.m_x = round_to_int(self.pos.x);
         out.m_y = round_to_int(self.pos.y);
-
-        // velocity is scaled by 256 like in C++
         out.m_vel_x = round_to_int(self.vel.x * 256.0);
         out.m_vel_y = round_to_int(self.vel.y * 256.0);
-
         out.m_hook_state = self.hook_state;
         out.m_hook_tick = self.hook_tick;
         out.m_hook_x = round_to_int(self.hook_pos.x);
         out.m_hook_y = round_to_int(self.hook_pos.y);
-
         out.m_hook_dx = round_to_int(self.hook_dir.x * 256.0);
         out.m_hook_dy = round_to_int(self.hook_dir.y * 256.0);
-
         out.m_hooked_player = self.hooked_player;
         out.m_jumped = self.jumped;
         out.m_direction = self.direction;
@@ -109,68 +100,63 @@ impl<'a> CharacterCore<'a> {
     }
 
     pub fn read_netobj(&mut self, obj: &NetObjCharacterCore) {
-        // position
         self.pos.x = obj.m_x as f32;
         self.pos.y = obj.m_y as f32;
-
-        // velocity scaled back down
         self.vel.x = (obj.m_vel_x as f32) / 256.0;
         self.vel.y = (obj.m_vel_y as f32) / 256.0;
-
         self.hook_state = obj.m_hook_state;
         self.hook_tick = obj.m_hook_tick;
-
         self.hook_pos.x = obj.m_hook_x as f32;
         self.hook_pos.y = obj.m_hook_y as f32;
-
-        // hook dir scaled
         self.hook_dir.x = (obj.m_hook_dx as f32) / 256.0;
         self.hook_dir.y = (obj.m_hook_dy as f32) / 256.0;
-
         self.hooked_player = obj.m_hooked_player;
         self.jumped = obj.m_jumped;
         self.direction = obj.m_direction;
         self.angle = obj.m_angle;
     }
 
+    pub fn quantize(&mut self) {
+        let mut tmp = NetObjCharacterCore {
+            m_x: 0, m_y: 0, m_vel_x: 0, m_vel_y: 0,
+            m_hook_state: 0, m_hook_tick: 0,
+            m_hook_x: 0, m_hook_y: 0, m_hook_dx: 0, m_hook_dy: 0,
+            m_hooked_player: 0, m_jumped: 0, m_direction: 0, m_angle: 0,
+        };
+        self.write_netobj(&mut tmp);
+        self.read_netobj(&tmp);
+    }
+
     pub fn tick(&mut self, use_input: bool) {
         self.triggered_events = 0;
 
-        // grounded check
         let grounded = if let Some(collision) = self.collision {
-            collision.check_point(self.pos.x + PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0) ||
-                collision.check_point(self.pos.x - PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
+            collision.check_point(self.pos.x + PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
+                || collision.check_point(self.pos.x - PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
         } else {
             false
         };
 
         let target_dir = self.input.get_target_direction();
 
-        // gravity
         if let Some(world) = self.world {
             self.vel.y += world.tuning.gravity;
         }
 
-        let (max_speed, accel, friction) = if grounded {
-            if let Some(world) = self.world {
+        let (max_speed, accel, friction) = if let Some(world) = self.world {
+            if grounded {
                 (world.tuning.ground_control_speed, world.tuning.ground_control_accel, world.tuning.ground_friction)
             } else {
-                (1.0, 1.0, 1.0) // fallback
+                (world.tuning.air_control_speed, world.tuning.air_control_accel, world.tuning.air_friction)
             }
         } else {
-            if let Some(world) = self.world {
-                (world.tuning.air_control_speed, world.tuning.air_control_accel, world.tuning.air_friction)
-            } else {
-                (1.0, 1.0, 1.0)
-            }
+            (1.0, 1.0, 1.0)
         };
 
-        // handle input
         if use_input {
             self.direction = self.input.direction;
             self.angle = (target_dir.angle() * 256.0) as i32;
 
-            // jumping
             if self.input.jump {
                 if self.jumped & 1 == 0 {
                     if grounded {
@@ -191,7 +177,6 @@ impl<'a> CharacterCore<'a> {
                 self.jumped &= !1;
             }
 
-            // hook input
             if self.input.hook {
                 if self.hook_state == HOOK_IDLE {
                     self.hook_state = HOOK_FLYING;
@@ -207,7 +192,6 @@ impl<'a> CharacterCore<'a> {
             }
         }
 
-        // movement
         if self.direction < 0 {
             self.vel.x = saturated_add(-max_speed, max_speed, self.vel.x, -accel);
         }
@@ -222,87 +206,130 @@ impl<'a> CharacterCore<'a> {
             self.jumped &= !2;
         }
 
-        // handle hook
         self.update_hook();
 
-        // clamp velocity
         if self.vel.length() > 6000.0 {
             self.vel = self.vel.normalize() * 6000.0;
         }
     }
 
     pub fn move_core(&mut self) {
-        if self.world.is_none() {
+        if self.world.is_none() || self.collision.is_none() {
             return;
         }
 
-        // velocity ramp like C++ version
-        if let Some(world) = self.world {
-            let ramp = velocity_ramp(self.vel.length() * 50.0,
-                                     world.tuning.velramp_start,
-                                     world.tuning.velramp_range,
-                                     world.tuning.velramp_curvature);
-            self.vel.x *= ramp;
-        }
+        let ramp = if let Some(world) = self.world {
+            velocity_ramp(
+                self.vel.length() * 50.0,
+                world.tuning.velramp_start,
+                world.tuning.velramp_range,
+                world.tuning.velramp_curvature,
+            )
+        } else {
+            1.0
+        };
+        self.vel.x *= ramp;
 
-        // move using collision system
         if let Some(collision) = self.collision {
             let mut new_pos = self.pos;
-            collision.move_box(&mut new_pos, &mut self.vel, Vec2 { x: PHYS_SIZE, y: PHYS_SIZE }, 0, self.death);
+            collision.move_box(
+                &mut new_pos,
+                &mut self.vel,
+                Vec2 { x: PHYS_SIZE, y: PHYS_SIZE },
+                0.0,
+                Some(&mut self.death),
+            );
             self.pos = new_pos;
         }
 
-        // restore velocity x after ramp
-        if let Some(world) = self.world {
-            let ramp = velocity_ramp(self.vel.length() * 50.0,
-                                     world.tuning.velramp_start,
-                                     world.tuning.velramp_range,
-                                     world.tuning.velramp_curvature);
+        let ramp = if let Some(world) = self.world {
+            velocity_ramp(
+                self.vel.length() * 50.0,
+                world.tuning.velramp_start,
+                world.tuning.velramp_range,
+                world.tuning.velramp_curvature,
+            )
+        } else {
+            1.0
+        };
+        if ramp != 0.0 {
             self.vel.x *= 1.0 / ramp;
         }
     }
-    /// Same as CCharacterCore::Quantize — write then read on local object
-    pub fn quantize(&mut self) {
-        // create temporary network object
-        let mut tmp = NetObjCharacterCore {
-            m_x: 0,
-            m_y: 0,
-            m_vel_x: 0,
-            m_vel_y: 0,
-            m_hook_state: 0,
-            m_hook_tick: 0,
-            m_hook_x: 0,
-            m_hook_y: 0,
-            m_hook_dx: 0,
-            m_hook_dy: 0,
-            m_hooked_player: 0,
-            m_jumped: 0,
-            m_direction: 0,
-            m_angle: 0,
-        };
 
-        // serialize current state
-        self.write_netobj(&mut tmp);
-        // read it back to truncate/quantize floats
-        self.read_netobj(&tmp);
-    }
-}
+    fn update_hook(&mut self) {
+        if self.hook_state == HOOK_IDLE {
+            self.hooked_player = -1;
+            self.hook_pos = self.pos;
+            return;
+        }
 
-pub fn saturated_add(min: f32, max: f32, current: f32, add: f32) -> f32 {
-    (current + add).clamp(min, max)
-}
+        if self.hook_state >= HOOK_RETRACT_START && self.hook_state < HOOK_RETRACT_END {
+            self.hook_state += 1;
+            return;
+        }
 
-// convert float -> rounded int
-fn round_to_int(f: f32) -> i32 {
-    f.round() as i32
-}
+        if self.hook_state == HOOK_RETRACT_END {
+            self.hook_state = HOOK_RETRACTED;
+            return;
+        }
 
-pub fn velocity_ramp(value: f32, start: f32, range: f32, curvature: f32) -> f32 {
-    if value < start {
-        1.0
-    } else if value > start + range {
-        1.0 + curvature
-    } else {
-        1.0 + curvature * ((value - start) / range)
+        let (hook_fire_speed, hook_length, hook_drag_accel, hook_drag_speed) =
+            if let Some(world) = self.world {
+                (
+                    world.tuning.hook_fire_speed,
+                    world.tuning.hook_length,
+                    world.tuning.hook_drag_accel,
+                    world.tuning.hook_drag_speed,
+                )
+            } else {
+                return;
+            };
+
+        if self.hook_state == HOOK_FLYING {
+            let mut new_pos = self.hook_pos + self.hook_dir * hook_fire_speed;
+
+            if self.pos.distance(&new_pos) > hook_length {
+                self.hook_state = HOOK_RETRACT_START;
+                new_pos = self.pos + (new_pos - self.pos).normalize() * hook_length;
+            }
+
+            if let Some(collision) = self.collision {
+                let (hit_ground, hit_nohook, clipped) =
+                    collision.intersect_line(self.hook_pos, new_pos);
+
+                if self.hook_state == HOOK_FLYING {
+                    if hit_ground {
+                        self.triggered_events |= COREEVENTFLAG_HOOK_ATTACH_GROUND;
+                        self.hook_state = HOOK_GRABBED;
+                    } else if hit_nohook {
+                        self.triggered_events |= COREEVENTFLAG_HOOK_HIT_NOHOOK;
+                        self.hook_state = HOOK_RETRACT_START;
+                    }
+                    self.hook_pos = clipped;
+                }
+            } else {
+                self.hook_pos = new_pos;
+            }
+        } else if self.hook_state == HOOK_GRABBED && self.hooked_player == -1 {
+            let diff = self.hook_pos - self.pos;
+            let dist = diff.length();
+
+            if dist > 46.0 {
+                let dir = diff.normalize();
+                self.hook_drag_vel = self.hook_drag_vel + dir * hook_drag_accel;
+                let len = self.hook_drag_vel.length();
+                if len > hook_drag_speed {
+                    self.hook_drag_vel = self.hook_drag_vel * (hook_drag_speed / len);
+                }
+            }
+
+            self.hook_tick += 1;
+            if self.hook_tick > SERVER_TICK_SPEED + SERVER_TICK_SPEED / 5 || dist < 46.0 {
+                self.hook_drag_vel = Vec2::zero();
+                self.hook_state = HOOK_RETRACTED;
+                self.hook_pos = self.pos;
+            }
+        }
     }
 }

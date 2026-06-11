@@ -1,6 +1,5 @@
 // src/world_core.rs
 
-use crate::vec2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tuning {
