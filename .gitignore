@@ -76,3 +76,6 @@ googletest-src
 install_manifest.txt
 pack_*/
 rules.ninja
+
+target
+
