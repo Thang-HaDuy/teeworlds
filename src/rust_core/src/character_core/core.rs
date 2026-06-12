@@ -1,14 +1,15 @@
-use crate::vec2::Vec2;
-use crate::vec2::saturated_add;
+use crate::vec2::{Vec2, saturated_add};
 use crate::world_core::WorldCore;
 use crate::collision::Collision;
 use crate::netobj::{NetObjCharacterCore, PlayerInput};
 use super::constants::*;
-use super::helpers::{round_to_int, velocity_ramp};
+use super::helpers::{round_to_int, velocity_ramp, dot, mix, closest_point_on_line};
 
-pub struct CharacterCore<'a> {
-    pub world: Option<&'a WorldCore>,
-    pub collision: Option<&'a Collision>,
+pub struct CharacterCore {
+    /// Raw pointer to the shared WorldCore. Must be set via init() before tick/move.
+    pub world: *mut WorldCore,
+    /// Raw pointer to the Collision instance. Must be set via init() before tick/move.
+    pub collision: *mut Collision,
 
     pub pos: Vec2,
     pub vel: Vec2,
@@ -29,11 +30,14 @@ pub struct CharacterCore<'a> {
     pub triggered_events: i32,
 }
 
-impl<'a> CharacterCore<'a> {
+// SAFETY: CharacterCore is used single-threaded in the game loop.
+unsafe impl Send for CharacterCore {}
+
+impl CharacterCore {
     pub fn new() -> Self {
         Self {
-            world: None,
-            collision: None,
+            world: std::ptr::null_mut(),
+            collision: std::ptr::null_mut(),
             pos: Vec2::zero(),
             vel: Vec2::zero(),
             hook_drag_vel: Vec2::zero(),
@@ -51,9 +55,9 @@ impl<'a> CharacterCore<'a> {
         }
     }
 
-    pub fn init(&mut self, world: &'a WorldCore, collision: &'a Collision) {
-        self.world = Some(world);
-        self.collision = Some(collision);
+    pub fn init(&mut self, world: &mut WorldCore, collision: &mut Collision) {
+        self.world = world as *mut _;
+        self.collision = collision as *mut _;
     }
 
     pub fn reset(&mut self) {
@@ -71,11 +75,13 @@ impl<'a> CharacterCore<'a> {
     }
 
     pub fn add_drag_velocity(&mut self) {
-        if let Some(world) = self.world {
-            let ds = world.tuning.hook_drag_speed;
-            self.vel.x = saturated_add(-ds, ds, self.vel.x, self.hook_drag_vel.x);
-            self.vel.y = saturated_add(-ds, ds, self.vel.y, self.hook_drag_vel.y);
-        }
+        let world = match unsafe { self.world.as_ref() } {
+            Some(w) => w,
+            None => return,
+        };
+        let ds = world.tuning.hook_drag_speed;
+        self.vel.x = saturated_add(-ds, ds, self.vel.x, self.hook_drag_vel.x);
+        self.vel.y = saturated_add(-ds, ds, self.vel.y, self.hook_drag_vel.y);
     }
 
     pub fn reset_drag_velocity(&mut self) {
@@ -127,30 +133,31 @@ impl<'a> CharacterCore<'a> {
         self.read_netobj(&tmp);
     }
 
+    /// Mirrors C++ CCharacterCore::Tick(bool UseInput).
     pub fn tick(&mut self, use_input: bool) {
+        let world = match unsafe { self.world.as_ref() } {
+            Some(w) => w,
+            None => return,
+        };
+        let collision = match unsafe { self.collision.as_ref() } {
+            Some(c) => c,
+            None => return,
+        };
+
         self.triggered_events = 0;
 
-        let grounded = if let Some(collision) = self.collision {
+        let grounded =
             collision.check_point(self.pos.x + PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
-                || collision.check_point(self.pos.x - PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
-        } else {
-            false
-        };
+                || collision.check_point(self.pos.x - PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0);
 
         let target_dir = self.input.get_target_direction();
 
-        if let Some(world) = self.world {
-            self.vel.y += world.tuning.gravity;
-        }
+        self.vel.y += world.tuning.gravity;
 
-        let (max_speed, accel, friction) = if let Some(world) = self.world {
-            if grounded {
-                (world.tuning.ground_control_speed, world.tuning.ground_control_accel, world.tuning.ground_friction)
-            } else {
-                (world.tuning.air_control_speed, world.tuning.air_control_accel, world.tuning.air_friction)
-            }
+        let (max_speed, accel, friction) = if grounded {
+            (world.tuning.ground_control_speed, world.tuning.ground_control_accel, world.tuning.ground_friction)
         } else {
-            (1.0, 1.0, 1.0)
+            (world.tuning.air_control_speed, world.tuning.air_control_accel, world.tuning.air_friction)
         };
 
         if use_input {
@@ -161,15 +168,11 @@ impl<'a> CharacterCore<'a> {
                 if self.jumped & 1 == 0 {
                     if grounded {
                         self.triggered_events |= COREEVENTFLAG_GROUND_JUMP;
-                        if let Some(world) = self.world {
-                            self.vel.y = -world.tuning.ground_jump_impulse;
-                        }
+                        self.vel.y = -world.tuning.ground_jump_impulse;
                         self.jumped |= 1;
                     } else if self.jumped & 2 == 0 {
                         self.triggered_events |= COREEVENTFLAG_AIR_JUMP;
-                        if let Some(world) = self.world {
-                            self.vel.y = -world.tuning.air_jump_impulse;
-                        }
+                        self.vel.y = -world.tuning.air_jump_impulse;
                         self.jumped |= 3;
                     }
                 }
@@ -206,130 +209,236 @@ impl<'a> CharacterCore<'a> {
             self.jumped &= !2;
         }
 
-        self.update_hook();
+        // ---- Hook state machine (mirrors C++ CCharacterCore::Tick inline) ----
 
+        if self.hook_state == HOOK_IDLE {
+            self.hooked_player = -1;
+            self.hook_pos = self.pos;
+        } else if self.hook_state >= HOOK_RETRACT_START && self.hook_state < HOOK_RETRACT_END {
+            self.hook_state += 1;
+        } else if self.hook_state == HOOK_RETRACT_END {
+            self.hook_state = HOOK_RETRACTED;
+        } else if self.hook_state == HOOK_FLYING {
+            let mut new_pos = self.hook_pos + self.hook_dir * world.tuning.hook_fire_speed;
+
+            if (self.pos - new_pos).length() > world.tuning.hook_length {
+                self.hook_state = HOOK_RETRACT_START;
+                new_pos = self.pos + (new_pos - self.pos).normalize() * world.tuning.hook_length;
+            }
+
+            // Tile collision check
+            let mut going_to_hit_ground = false;
+            let mut going_to_retract = false;
+            let (hit_ground, hit_nohook, clipped_pos) = collision.intersect_line(self.hook_pos, new_pos);
+            new_pos = clipped_pos;
+            if hit_ground {
+                going_to_hit_ground = true;
+            } else if hit_nohook {
+                going_to_retract = true;
+            }
+
+            // Player check has priority over tile collision
+            if world.tuning.player_hooking {
+                let mut best_dist = f32::MAX;
+                unsafe {
+                    for i in 0..MAX_CLIENTS {
+                        let pchar = world.ap_characters[i];
+                        if pchar.is_null() || pchar == self as *mut _ {
+                            continue;
+                        }
+                        let pchar_ref = &*pchar;
+                        let closest = closest_point_on_line(self.hook_pos, new_pos, pchar_ref.pos);
+                        if (pchar_ref.pos - closest).length() < PHYS_SIZE + 2.0 {
+                            let dist = (self.hook_pos - pchar_ref.pos).length();
+                            if self.hooked_player == -1 || dist < best_dist {
+                                self.triggered_events |= COREEVENTFLAG_HOOK_ATTACH_PLAYER;
+                                self.hook_state = HOOK_GRABBED;
+                                self.hooked_player = i as i32;
+                                best_dist = dist;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Ground/nohook check only if still flying after player check
+            if self.hook_state == HOOK_FLYING {
+                if going_to_hit_ground {
+                    self.triggered_events |= COREEVENTFLAG_HOOK_ATTACH_GROUND;
+                    self.hook_state = HOOK_GRABBED;
+                } else if going_to_retract {
+                    self.triggered_events |= COREEVENTFLAG_HOOK_HIT_NOHOOK;
+                    self.hook_state = HOOK_RETRACT_START;
+                }
+                self.hook_pos = new_pos;
+            }
+        }
+
+        if self.hook_state == HOOK_GRABBED {
+            if self.hooked_player != -1 {
+                unsafe {
+                    let pchar = world.ap_characters[self.hooked_player as usize];
+                    if !pchar.is_null() {
+                        // Track hooked player's position
+                        self.hook_pos = (*pchar).pos;
+                    } else {
+                        // Hooked player disappeared — release
+                        self.hooked_player = -1;
+                        self.hook_state = HOOK_RETRACTED;
+                        self.hook_pos = self.pos;
+                    }
+                }
+            }
+
+            // Ground hook drag — only when not hooked to a player
+            if self.hooked_player == -1 && (self.hook_pos - self.pos).length() > 46.0 {
+                let mut hook_vel = (self.hook_pos - self.pos).normalize() * world.tuning.hook_drag_accel;
+
+                // Upward pull is stronger (easier to climb platforms)
+                if hook_vel.y > 0.0 {
+                    hook_vel.y *= 0.3;
+                }
+                // Boost horizontal pull when moving in that direction, dampen otherwise
+                if (hook_vel.x < 0.0 && self.direction < 0) || (hook_vel.x > 0.0 && self.direction > 0) {
+                    hook_vel.x *= 0.95;
+                } else {
+                    hook_vel.x *= 0.75;
+                }
+
+                let new_vel = self.vel + hook_vel;
+                // Only apply if it doesn't exceed drag speed limit OR is decelerating
+                if new_vel.length() < world.tuning.hook_drag_speed || new_vel.length() < self.vel.length() {
+                    self.vel = new_vel;
+                }
+            }
+
+            // Timeout for player hooks (1.25 seconds)
+            self.hook_tick += 1;
+            if self.hooked_player != -1 {
+                let still_alive = !world.ap_characters[self.hooked_player as usize].is_null();
+                if self.hook_tick > SERVER_TICK_SPEED + SERVER_TICK_SPEED / 5 || !still_alive {
+                    self.hooked_player = -1;
+                    self.hook_state = HOOK_RETRACTED;
+                    self.hook_pos = self.pos;
+                }
+            }
+        }
+
+        // ---- Player-player collision and hook drag (mirrors C++ Tick loop) ----
+        unsafe {
+            for i in 0..MAX_CLIENTS {
+                let pchar = world.ap_characters[i];
+                if pchar.is_null() || pchar == self as *mut _ {
+                    continue;
+                }
+                let pchar_ref = &mut *pchar;
+
+                let dist = (self.pos - pchar_ref.pos).length();
+                let dir = (self.pos - pchar_ref.pos).normalize();
+
+                // Push characters apart when overlapping
+                if world.tuning.player_collision && dist < PHYS_SIZE * 1.25 && dist > 0.0 {
+                    let overlap = PHYS_SIZE * 1.45 - dist;
+                    let velocity = if self.vel.length() > 0.0001 {
+                        1.0 - (dot(self.vel.normalize(), dir) + 1.0) / 2.0
+                    } else {
+                        0.5
+                    };
+                    self.vel = self.vel + dir * overlap * (velocity * 0.75);
+                    self.vel = self.vel * 0.85;
+                }
+
+                // Apply hook drag forces between hooker and hooked player
+                if self.hooked_player == i as i32 && world.tuning.player_hooking {
+                    if dist > PHYS_SIZE * 1.5 {
+                        let accel = world.tuning.hook_drag_accel * (dist / world.tuning.hook_length);
+                        // Pull hooked player toward hooker
+                        pchar_ref.hook_drag_vel = pchar_ref.hook_drag_vel + dir * accel * 1.5;
+                        // Small counter-force on the hooker
+                        self.hook_drag_vel = self.hook_drag_vel - dir * accel * 0.25;
+                    }
+                }
+            }
+        }
+
+        // Clamp velocity
         if self.vel.length() > 6000.0 {
             self.vel = self.vel.normalize() * 6000.0;
         }
     }
 
+    /// Mirrors C++ CCharacterCore::Move().
     pub fn move_core(&mut self) {
-        if self.world.is_none() || self.collision.is_none() {
-            return;
-        }
-
-        let ramp = if let Some(world) = self.world {
-            velocity_ramp(
-                self.vel.length() * 50.0,
-                world.tuning.velramp_start,
-                world.tuning.velramp_range,
-                world.tuning.velramp_curvature,
-            )
-        } else {
-            1.0
+        let world = match unsafe { self.world.as_ref() } {
+            Some(w) => w,
+            None => return,
         };
+        let collision = match unsafe { self.collision.as_ref() } {
+            Some(c) => c,
+            None => return,
+        };
+
+        let ramp = velocity_ramp(
+            self.vel.length() * 50.0,
+            world.tuning.velramp_start,
+            world.tuning.velramp_range,
+            world.tuning.velramp_curvature,
+        );
         self.vel.x *= ramp;
 
-        if let Some(collision) = self.collision {
-            let mut new_pos = self.pos;
-            collision.move_box(
-                &mut new_pos,
-                &mut self.vel,
-                Vec2 { x: PHYS_SIZE, y: PHYS_SIZE },
-                0.0,
-                Some(&mut self.death),
-            );
-            self.pos = new_pos;
-        }
+        let mut new_pos = self.pos;
+        collision.move_box(
+            &mut new_pos,
+            &mut self.vel,
+            Vec2 { x: PHYS_SIZE, y: PHYS_SIZE },
+            0.0,
+            Some(&mut self.death),
+        );
 
-        let ramp = if let Some(world) = self.world {
-            velocity_ramp(
-                self.vel.length() * 50.0,
-                world.tuning.velramp_start,
-                world.tuning.velramp_range,
-                world.tuning.velramp_curvature,
-            )
-        } else {
-            1.0
-        };
         if ramp != 0.0 {
             self.vel.x *= 1.0 / ramp;
         }
-    }
 
-    fn update_hook(&mut self) {
-        if self.hook_state == HOOK_IDLE {
-            self.hooked_player = -1;
-            self.hook_pos = self.pos;
-            return;
-        }
+        if world.tuning.player_collision {
+            let dist = (self.pos - new_pos).length();
+            let end = dist as i32 + 1;
+            let mut last_pos = self.pos;
+            let mut collision_found = false;
+            let mut collision_pos = self.pos; // default: stay in place on early return
 
-        if self.hook_state >= HOOK_RETRACT_START && self.hook_state < HOOK_RETRACT_END {
-            self.hook_state += 1;
-            return;
-        }
+            'outer: for i in 0..end {
+                let a = if dist > 0.0 { i as f32 / dist } else { 0.0 };
+                let pos = mix(self.pos, new_pos, a);
 
-        if self.hook_state == HOOK_RETRACT_END {
-            self.hook_state = HOOK_RETRACTED;
-            return;
-        }
-
-        let (hook_fire_speed, hook_length, hook_drag_accel, hook_drag_speed) =
-            if let Some(world) = self.world {
-                (
-                    world.tuning.hook_fire_speed,
-                    world.tuning.hook_length,
-                    world.tuning.hook_drag_accel,
-                    world.tuning.hook_drag_speed,
-                )
-            } else {
-                return;
-            };
-
-        if self.hook_state == HOOK_FLYING {
-            let mut new_pos = self.hook_pos + self.hook_dir * hook_fire_speed;
-
-            if self.pos.distance(&new_pos) > hook_length {
-                self.hook_state = HOOK_RETRACT_START;
-                new_pos = self.pos + (new_pos - self.pos).normalize() * hook_length;
-            }
-
-            if let Some(collision) = self.collision {
-                let (hit_ground, hit_nohook, clipped) =
-                    collision.intersect_line(self.hook_pos, new_pos);
-
-                if self.hook_state == HOOK_FLYING {
-                    if hit_ground {
-                        self.triggered_events |= COREEVENTFLAG_HOOK_ATTACH_GROUND;
-                        self.hook_state = HOOK_GRABBED;
-                    } else if hit_nohook {
-                        self.triggered_events |= COREEVENTFLAG_HOOK_HIT_NOHOOK;
-                        self.hook_state = HOOK_RETRACT_START;
+                unsafe {
+                    for p in 0..MAX_CLIENTS {
+                        let pchar = world.ap_characters[p];
+                        if pchar.is_null() || pchar == self as *mut _ {
+                            continue;
+                        }
+                        let pchar_ref = &*pchar;
+                        let d = (pos - pchar_ref.pos).length();
+                        if d < PHYS_SIZE && d >= 0.0 {
+                            collision_found = true;
+                            if a > 0.0 {
+                                collision_pos = last_pos;
+                            } else if (new_pos - pchar_ref.pos).length() > d {
+                                collision_pos = new_pos;
+                            }
+                            // else: neither condition — pos stays as self.pos (no move)
+                            break 'outer;
+                        }
                     }
-                    self.hook_pos = clipped;
                 }
-            } else {
-                self.hook_pos = new_pos;
-            }
-        } else if self.hook_state == HOOK_GRABBED && self.hooked_player == -1 {
-            let diff = self.hook_pos - self.pos;
-            let dist = diff.length();
-
-            if dist > 46.0 {
-                let dir = diff.normalize();
-                self.hook_drag_vel = self.hook_drag_vel + dir * hook_drag_accel;
-                let len = self.hook_drag_vel.length();
-                if len > hook_drag_speed {
-                    self.hook_drag_vel = self.hook_drag_vel * (hook_drag_speed / len);
-                }
+                last_pos = pos;
             }
 
-            self.hook_tick += 1;
-            if self.hook_tick > SERVER_TICK_SPEED + SERVER_TICK_SPEED / 5 || dist < 46.0 {
-                self.hook_drag_vel = Vec2::zero();
-                self.hook_state = HOOK_RETRACTED;
-                self.hook_pos = self.pos;
+            if collision_found {
+                self.pos = collision_pos;
+                return;
             }
         }
+
+        self.pos = new_pos;
     }
 }

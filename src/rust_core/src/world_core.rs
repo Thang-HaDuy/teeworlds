@@ -1,5 +1,5 @@
-// src/world_core.rs
-
+use crate::character_core::CharacterCore;
+use crate::character_core::MAX_CLIENTS;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tuning {
@@ -16,6 +16,7 @@ pub struct Tuning {
     pub hook_drag_accel: f32,
     pub hook_drag_speed: f32,
     pub hook_length: f32,
+    pub player_collision: bool,
     pub player_hooking: bool,
     pub velramp_start: f32,
     pub velramp_range: f32,
@@ -29,41 +30,46 @@ impl Default for Tuning {
     fn default() -> Self {
         Self {
             gravity: 0.5,
-            ground_control_speed: 1.0,
-            ground_control_accel: 0.8,
-            ground_friction: 0.7,
-            air_control_speed: 0.6,
-            air_control_accel: 0.5,
-            air_friction: 0.98,
-            ground_jump_impulse: 10.0,
-            air_jump_impulse: 8.0,
-            hook_fire_speed: 20.0,
-            hook_drag_accel: 2.0,
-            hook_drag_speed: 12.0,
-            hook_length: 200.0,
+            ground_control_speed: 10.0,
+            ground_control_accel: 100.0 / 50.0,
+            ground_friction: 0.5,
+            air_control_speed: 8.0,
+            air_control_accel: 250.0 / 50.0 / 50.0,
+            air_friction: 0.95,
+            ground_jump_impulse: 13.2,
+            air_jump_impulse: 12.0,
+            hook_fire_speed: 80.0,
+            hook_drag_accel: 3.0,
+            hook_drag_speed: 15.0,
+            hook_length: 380.0,
+            player_collision: true,
             player_hooking: true,
-            velramp_start: 100.0,
-            velramp_range: 200.0,
-            velramp_curvature: 1.2,
-            shotgun_speeddiff: 0.9,
-            shotgun_lifetime: 1.5,
-            laser_reach: 300.0,
+            velramp_start: 550.0,
+            velramp_range: 2000.0,
+            velramp_curvature: 1.4,
+            shotgun_speeddiff: 0.8,
+            shotgun_lifetime: 2.0,
+            laser_reach: 800.0,
         }
     }
 }
 
-#[derive(Debug)]
 pub struct WorldCore {
     pub tuning: Tuning,
-    // Thêm các entity/character map nếu cần, ví dụ:
-    pub ap_characters: [Option<*mut ()>; 64], // placeholder pointer, sau này thay bằng CharacterCore reference
+    /// Pointers to all active CharacterCores, indexed by client ID.
+    /// Null pointer means slot is empty. Mirrors C++ CWorldCore::m_apCharacters.
+    pub ap_characters: [*mut CharacterCore; MAX_CLIENTS],
 }
+
+// SAFETY: WorldCore is used single-threaded in the game loop.
+unsafe impl Send for WorldCore {}
+unsafe impl Sync for WorldCore {}
 
 impl WorldCore {
     pub fn new() -> Self {
         Self {
             tuning: Tuning::default(),
-            ap_characters: [None; 64],
+            ap_characters: [std::ptr::null_mut(); MAX_CLIENTS],
         }
     }
 
@@ -74,6 +80,4 @@ impl WorldCore {
     pub fn tuning_mut(&mut self) -> &mut Tuning {
         &mut self.tuning
     }
-
-    // thêm các function cần thiết về va chạm hay tìm entity ở đây
 }

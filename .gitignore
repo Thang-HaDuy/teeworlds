@@ -77,5 +77,6 @@ install_manifest.txt
 pack_*/
 rules.ninja
 
+rust_core_changes.patch
 target
 

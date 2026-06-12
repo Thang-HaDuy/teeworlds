@@ -1,581 +1,1836 @@
-diff --git a/src/rust_core/src/character_core/constants.rs b/src/rust_core/src/character_core/constants.rs
+diff --git a/bot.py b/bot.py
 new file mode 100644
-index 00000000..e35b1795
+index 00000000..a10a6ffa
 --- /dev/null
++++ b/bot.py
+@@ -0,0 +1,598 @@
++#!/usr/bin/env python3
++"""
++Teeworlds minimal bot - connects to server, joins game, logs messages.
++Implements the full 0.7 connection handshake.
++"""
++
++import socket
++import random
++import time
++import math
++
++# ===== HUFFMAN =====
++FREQ_TABLE = [
++    1<<30,4545,2657,431,1950,919,444,482,2244,617,838,542,715,1814,304,240,754,212,647,186,
++    283,131,146,166,543,164,167,136,179,859,363,113,157,154,204,108,137,180,202,176,
++    872,404,168,134,151,111,113,109,120,126,129,100,41,20,16,22,18,18,17,19,
++    16,37,13,21,362,166,99,78,95,88,81,70,83,284,91,187,77,68,52,68,
++    59,66,61,638,71,157,50,46,69,43,11,24,13,19,10,12,12,20,14,9,
++    20,20,10,10,15,15,12,12,7,19,15,14,13,18,35,19,17,14,8,5,
++    15,17,9,15,14,18,8,10,2173,134,157,68,188,60,170,60,194,62,175,71,
++    148,67,167,78,211,67,156,69,1674,90,174,53,147,89,181,51,174,63,163,80,
++    167,94,128,122,223,153,218,77,200,110,190,73,174,69,145,66,277,143,141,60,
++    136,53,180,57,142,57,158,61,166,112,152,92,26,22,21,28,20,26,30,21,
++    32,27,20,17,23,21,30,22,22,21,27,25,17,27,23,18,39,26,15,21,
++    12,18,18,27,20,18,15,19,11,17,33,12,18,15,19,18,16,26,17,18,
++    9,10,25,22,22,17,20,16,6,16,15,20,14,18,24,335,1517
++]
++
++HUFFMAN_EOF = 256
++HUFFMAN_MAX_SYM = 257
++HUFFMAN_MAX_NODES = HUFFMAN_MAX_SYM * 2 - 1
++HUFFMAN_LUTBITS = 10
++HUFFMAN_LUTSIZE = 1 << HUFFMAN_LUTBITS
++HUFFMAN_LUTMASK = HUFFMAN_LUTSIZE - 1
++
++class _HNode:
++    __slots__ = ['bits','num_bits','leafs','symbol']
++    def __init__(self):
++        self.bits = 0; self.num_bits = 0
++        self.leafs = [0xffff, 0xffff]; self.symbol = 0
++
++class Huffman:
++    def __init__(self):
++        self._nodes = [_HNode() for _ in range(HUFFMAN_MAX_NODES)]
++        self._lut = [None] * HUFFMAN_LUTSIZE
++        self._start = 0
++        self._build()
++
++    def _setbits(self, idx, bits, depth):
++        n = self._nodes[idx]
++        if n.leafs[1] != 0xffff: self._setbits(n.leafs[1], bits|(1<<depth), depth+1)
++        if n.leafs[0] != 0xffff: self._setbits(n.leafs[0], bits, depth+1)
++        if n.num_bits:
++            n.bits = bits; n.num_bits = depth
++
++    def _build(self):
++        nodes = self._nodes
++        for i in range(HUFFMAN_MAX_SYM):
++            nodes[i].num_bits = 0xFFFFFFFF
++            nodes[i].symbol = i
++            nodes[i].leafs = [0xffff, 0xffff]
++
++        freq_list = [[1 if i == HUFFMAN_EOF else FREQ_TABLE[i], i] for i in range(HUFFMAN_MAX_SYM)]
++        num = HUFFMAN_MAX_SYM
++
++        while len(freq_list) > 1:
++            freq_list.sort(key=lambda x: x[0], reverse=True)
++            a_id, b_id = freq_list[-1][1], freq_list[-2][1]
++            nodes[num].num_bits = 0
++            nodes[num].leafs[0] = a_id
++            nodes[num].leafs[1] = b_id
++            freq_list[-2][0] = freq_list[-1][0] + freq_list[-2][0]
++            freq_list[-2][1] = num
++            freq_list.pop(); num += 1
++
++        self._start = freq_list[0][1]
++        self._setbits(self._start, 0, 0)
++
++        for i in range(HUFFMAN_LUTSIZE):
++            bits = i; node = nodes[self._start]; k = 0
++            while k < HUFFMAN_LUTBITS:
++                li = node.leafs[bits & 1]
++                if li == 0xffff: break
++                node = nodes[li]; bits >>= 1; k += 1
++                if node.num_bits: self._lut[i] = node; break
++            if k == HUFFMAN_LUTBITS: self._lut[i] = node
++
++    def compress(self, data):
++        nodes = self._nodes
++        bits = 0; bitcount = 0; out = bytearray()
++        for b in data:
++            n = nodes[b]; bits |= n.bits << bitcount; bitcount += n.num_bits
++            while bitcount >= 8:
++                out.append(bits & 0xff); bits >>= 8; bitcount -= 8
++        n = nodes[HUFFMAN_EOF]; bits |= n.bits << bitcount; bitcount += n.num_bits
++        while bitcount > 0:
++            out.append(bits & 0xff); bits >>= 8; bitcount -= 8
++        return bytes(out)
++
++    def decompress(self, data):
++        nodes = self._nodes; lut = self._lut; eof = nodes[HUFFMAN_EOF]
++        out = bytearray(); bits = 0; bitcount = 0; i = 0; src = bytes(data)
++        while True:
++            node = lut[bits & HUFFMAN_LUTMASK] if bitcount >= HUFFMAN_LUTBITS else None
++            while bitcount < 24 and i < len(src):
++                bits |= src[i] << bitcount; bitcount += 8; i += 1
++            if node is None: node = lut[bits & HUFFMAN_LUTMASK]
++            if node is None: break
++            if node.num_bits:
++                bits >>= node.num_bits; bitcount -= node.num_bits
++            else:
++                bits >>= HUFFMAN_LUTBITS; bitcount -= HUFFMAN_LUTBITS
++                while True:
++                    node = nodes[node.leafs[bits & 1]]; bitcount -= 1; bits >>= 1
++                    if node.num_bits: break
++                    if bitcount == 0: return bytes(out)
++            if node is eof: break
++            out.append(node.symbol)
++        return bytes(out)
++
++_huff = Huffman()
++
++# ===== VARIABLE INT =====
++def pack_int(v):
++    out = bytearray(); b = 0
++    if v < 0: b |= 0x40; v = ~v
++    b |= v & 0x3F; v >>= 6
++    while v:
++        b |= 0x80; out.append(b); b = v & 0x7F; v >>= 7
++    out.append(b); return bytes(out)
++
++def unpack_int(data, pos=0):
++    if pos >= len(data): return 0, pos
++    sign = (data[pos] >> 6) & 1; val = data[pos] & 0x3F
++    masks = [0x7F, 0x7F, 0x7F, 0x0F]; shifts = [6, 13, 20, 27]
++    for i in range(4):
++        if not (data[pos] & 0x80): break
++        pos += 1
++        if pos >= len(data): break
++        val |= (data[pos] & masks[i]) << shifts[i]
++    pos += 1
++    return (~val if sign else val), pos
++
++def pack_str(s): return s.encode() + b'\x00'
++
++def unpack_str(data, pos=0):
++    end = data.index(b'\x00', pos)
++    return data[pos:end].decode(errors='replace'), end + 1
++
++# ===== CONSTANTS =====
++NET_PACKETFLAG_CONTROL    = 1
++NET_PACKETFLAG_RESEND     = 2
++NET_PACKETFLAG_COMPRESSION = 4
++NET_PACKETFLAG_CONNLESS   = 8
++NET_CHUNKFLAG_VITAL       = 1
++NET_CTRLMSG_KEEPALIVE     = 0
++NET_CTRLMSG_CONNECT       = 1
++NET_CTRLMSG_ACCEPT        = 2
++NET_CTRLMSG_CLOSE         = 4
++NET_CTRLMSG_TOKEN         = 5
++NET_MAX_SEQUENCE          = 1024
++
++# Engine message IDs (system) — values from src/engine/shared/protocol.h
++NETMSG_INFO            = 1
++NETMSG_MAP_CHANGE      = 2
++NETMSG_MAP_DATA        = 3
++NETMSG_SERVERINFO      = 4
++NETMSG_CON_READY       = 5
++NETMSG_SNAP            = 6
++NETMSG_SNAPEMPTY       = 7
++NETMSG_SNAPSINGLE      = 8
++NETMSG_INPUTTIMING     = 10
++NETMSG_RCON_LINE       = 13
++NETMSG_READY           = 18
++NETMSG_ENTERGAME       = 19
++NETMSG_INPUT           = 20
++NETMSG_REQUEST_MAP_DATA= 23
++NETMSG_PING            = 26
++NETMSG_PING_REPLY      = 27
++
++# Game message IDs (not system)
++SV_MOTD            = 1
++SV_TUNEPARAMS      = 6
++SV_READYTOENTER    = 8
++SV_SERVERSETTINGS  = 17
++SV_CLIENTINFO      = 18
++SV_GAMEINFO        = 19
++SV_CLIENTDROP      = 20
++SV_GAMEMSG         = 21
++CL_STARTINFO       = 27
++
++NET_VERSION = "0.7 802f1be60a05665f"
++
++SYS_MSG_NAMES = {
++    1:'INFO', 2:'MAP_CHANGE', 3:'MAP_DATA', 4:'SERVERINFO', 5:'CON_READY',
++    6:'SNAP', 7:'SNAPEMPTY', 8:'SNAPSINGLE', 10:'INPUTTIMING', 13:'RCON_LINE',
++    18:'READY', 19:'ENTERGAME', 20:'INPUT', 23:'REQUEST_MAP_DATA',
++    26:'PING', 27:'PING_REPLY',
++}
++GAME_MSG_NAMES = {
++    1:'SV_MOTD', 2:'SV_BROADCAST', 3:'SV_CHAT', 4:'SV_TEAM',
++    5:'SV_KILLMSG', 6:'SV_TUNEPARAMS', 7:'SV_EXTRAPROJECTILE',
++    8:'SV_READYTOENTER', 9:'SV_WEAPONPICKUP', 10:'SV_EMOTICON',
++    11:'SV_VOTECLEAROPTIONS', 17:'SV_SERVERSETTINGS', 18:'SV_CLIENTINFO',
++    19:'SV_GAMEINFO', 20:'SV_CLIENTDROP', 21:'SV_GAMEMSG',
++    27:'CL_STARTINFO',
++}
++
++
++class TeeBot:
++    def __init__(self, host='127.0.0.1', port=8303, name='TeeBot'):
++        self.addr = (host, port)
++        self.name = name
++        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        self.sock.settimeout(3.0)
++        self.token_cl = random.randrange(0x100000000)
++        self.token_srv = 0xFFFFFFFF
++        self.seq = 0    # our outgoing vital sequence
++        self.ack = 0    # last server vital seq we saw (sent back as ack)
++
++    # --- Packet header ---
++    def _pack_hdr(self, flags, num_chunks):
++        t = self.token_srv
++        return bytes([
++            ((flags & 0x3F) << 2) | ((self.ack >> 8) & 0x03),
++            self.ack & 0xFF,
++            num_chunks & 0xFF,
++            (t >> 24) & 0xFF, (t >> 16) & 0xFF, (t >> 8) & 0xFF, t & 0xFF
++        ])
++
++    def _unpack_hdr(self, raw):
++        flags = (raw[0] >> 2) & 0x3F
++        ack   = ((raw[0] & 0x03) << 8) | raw[1]
++        nch   = raw[2]
++        token = (raw[3] << 24) | (raw[4] << 16) | (raw[5] << 8) | raw[6]
++        return flags, ack, nch, token
++
++    # --- Chunk header ---
++    def _pack_chunk(self, data, vital):
++        size = len(data)
++        if vital:
++            self.seq = (self.seq + 1) % NET_MAX_SEQUENCE
++            s = self.seq
++            hdr = bytes([
++                (NET_CHUNKFLAG_VITAL << 6) | ((size >> 6) & 0x3F),
++                (size & 0x3F) | ((s >> 2) & 0xC0),
++                s & 0xFF
++            ])
++        else:
++            hdr = bytes([(size >> 6) & 0x3F, size & 0x3F])
++        return hdr + data
++
++    def _unpack_chunk_hdr(self, payload, off):
++        flags = (payload[off] >> 6) & 0x03
++        size  = ((payload[off] & 0x3F) << 6) | (payload[off+1] & 0x3F)
++        if flags & NET_CHUNKFLAG_VITAL:
++            seq = ((payload[off+1] & 0xC0) << 2) | payload[off+2]
++            return flags, size, seq, off + 3
++        return flags, size, -1, off + 2
++
++    # --- Send helpers ---
++    def _send_raw(self, data): self.sock.sendto(data, self.addr)
++
++    def _send_ctrl(self, msg_type, extra=b''):
++        self._send_raw(self._pack_hdr(NET_PACKETFLAG_CONTROL, 0) + bytes([msg_type]) + extra)
++
++    def _send_msg(self, msg_data, vital=True):
++        chunk = self._pack_chunk(msg_data, vital)
++        compressed = _huff.compress(chunk)
++        if len(compressed) < len(chunk):
++            hdr = self._pack_hdr(NET_PACKETFLAG_COMPRESSION, 1)
++            self._send_raw(hdr + compressed)
++        else:
++            hdr = self._pack_hdr(0, 1)
++            self._send_raw(hdr + chunk)
++
++    def _sys(self, msg_id, data=b''):
++        return pack_int((msg_id << 1) | 1) + data
++
++    def _game(self, msg_id, data=b''):
++        return pack_int((msg_id << 1) | 0) + data
++
++    # --- Receive ---
++    def _recv(self, timeout=3.0):
++        self.sock.settimeout(timeout)
++        try:
++            raw, _ = self.sock.recvfrom(4096)
++        except socket.timeout:
++            return None, []
++        if len(raw) < 7:
++            return None, []
++
++        flags, ack, nch, token = self._unpack_hdr(raw)
++
++        if flags & NET_PACKETFLAG_CONNLESS:
++            return 'connless', []
++
++        if flags & NET_PACKETFLAG_CONTROL:
++            ctrl = raw[7] if len(raw) > 7 else -1
++            rest = raw[8:] if len(raw) > 8 else b''
++            return 'ctrl', [(ctrl, rest)]
++
++        payload = raw[7:]
++        if flags & NET_PACKETFLAG_COMPRESSION:
++            payload = _huff.decompress(payload)
++
++        chunks = []; off = 0
++        for _ in range(nch):
++            if off + 2 > len(payload): break
++            ch_flags, ch_size, ch_seq, off = self._unpack_chunk_hdr(payload, off)
++            if off + ch_size > len(payload): break
++            ch_data = payload[off:off+ch_size]; off += ch_size
++            if ch_seq >= 0:
++                self.ack = ch_seq
++            chunks.append((ch_flags, ch_size, ch_seq, ch_data))
++        return 'data', chunks
++
++    def _parse_msg(self, data):
++        if not data: return None, None, b''
++        v, pos = unpack_int(data, 0)
++        return v >> 1, bool(v & 1), data[pos:]
++
++    # --- Connection steps ---
++    def step_token(self):
++        print("[bot] Token exchange...")
++        pad = bytes(512)
++        pkt = bytearray(7 + 1 + 4 + len(pad))
++        pkt[0] = (NET_PACKETFLAG_CONTROL << 2) & 0xFC
++        pkt[3:7] = b'\xff\xff\xff\xff'
++        pkt[7] = NET_CTRLMSG_TOKEN
++        pkt[8]  = (self.token_cl >> 24) & 0xFF
++        pkt[9]  = (self.token_cl >> 16) & 0xFF
++        pkt[10] = (self.token_cl >>  8) & 0xFF
++        pkt[11] =  self.token_cl        & 0xFF
++        self._send_raw(bytes(pkt))
++
++        raw, _ = self.sock.recvfrom(4096)
++        self.token_srv = (raw[8] << 24) | (raw[9] << 16) | (raw[10] << 8) | raw[11]
++        print(f"[bot]   token_srv={self.token_srv:#010x}")
++
++    def step_connect(self):
++        print("[bot] Connecting...")
++        self._send_ctrl(NET_CTRLMSG_CONNECT, bytes(512))
++        for _ in range(10):
++            ptype, chunks = self._recv(2.0)
++            if ptype == 'ctrl' and chunks and chunks[0][0] == NET_CTRLMSG_ACCEPT:
++                print("[bot]   ACCEPT received")
++                return
++        raise RuntimeError("No ACCEPT")
++
++    def step_info(self):
++        print("[bot] Sending INFO...")
++        self._send_msg(self._sys(NETMSG_INFO,
++            pack_str(NET_VERSION) + pack_str("") + pack_int(0)))
++
++    def step_wait_map(self):
++        print("[bot] Waiting for MAP_CHANGE...")
++        for _ in range(20):
++            ptype, chunks = self._recv()
++            if ptype == 'ctrl' and chunks and chunks[0][0] == NET_CTRLMSG_CLOSE:
++                reason = chunks[0][1].rstrip(b'\x00').decode(errors='replace')
++                raise RuntimeError(f"Server closed: {reason}")
++            if ptype != 'data': continue
++            for _, _, _, data in chunks:
++                mid, sys, payload = self._parse_msg(data)
++                if sys and mid == NETMSG_MAP_CHANGE:
++                    name, pos = unpack_str(payload)
++                    crc,  pos = unpack_int(payload, pos)
++                    size, pos = unpack_int(payload, pos)
++                    cpr,  pos = unpack_int(payload, pos)   # chunks_per_request
++                    csz,  pos = unpack_int(payload, pos)   # chunk_size
++                    self._map_size = size
++                    self._map_chunk_size = csz
++                    self._map_total_chunks = math.ceil(size / csz) if csz > 0 else 1
++                    print(f"[bot]   map={name!r} size={size} chunk_size={csz} total_chunks={self._map_total_chunks}")
++                    return
++                elif sys and mid == NETMSG_PING:
++                    self._send_msg(self._sys(NETMSG_PING_REPLY))
++        raise RuntimeError("No MAP_CHANGE")
++
++    def step_download_map(self):
++        received = 0
++        total = self._map_total_chunks
++        print(f"[bot] Downloading map ({total} chunks)...")
++        # Server sends all chunks in one batch (sv_map_download_speed=8 by default).
++        # Send one request, then drain all MAP_DATA until done.
++        # Only re-request if no data arrives for a while.
++        self._send_msg(self._sys(NETMSG_REQUEST_MAP_DATA, pack_int(0)))
++        timeouts = 0
++        while received < total:
++            ptype, chunks = self._recv(2.0)
++            if ptype is None:
++                timeouts += 1
++                if timeouts >= 2:
++                    self._send_msg(self._sys(NETMSG_REQUEST_MAP_DATA, pack_int(received)))
++                    timeouts = 0
++                continue
++            timeouts = 0
++            if ptype != 'data': continue
++            for _, _, _, data in chunks:
++                mid, sys, _ = self._parse_msg(data)
++                if sys and mid == NETMSG_MAP_DATA:
++                    received += 1
++                elif sys and mid == NETMSG_PING:
++                    self._send_msg(self._sys(NETMSG_PING_REPLY))
++        print(f"[bot]   map download complete ({received} chunks)")
++
++    def step_ready(self):
++        print("[bot] Sending READY...")
++        self._send_msg(self._sys(NETMSG_READY))
++
++    def step_wait_con_ready(self):
++        print("[bot] Waiting for CON_READY...")
++        for _ in range(20):
++            ptype, chunks = self._recv()
++            if ptype != 'data': continue
++            for _, _, _, data in chunks:
++                mid, sys, _ = self._parse_msg(data)
++                if sys and mid == NETMSG_CON_READY:
++                    print("[bot]   CON_READY received")
++                    return
++                elif sys and mid == NETMSG_PING:
++                    self._send_msg(self._sys(NETMSG_PING_REPLY))
++        raise RuntimeError("No CON_READY")
++
++    def step_startinfo(self):
++        print("[bot] Sending STARTINFO...")
++        skin_names  = b''.join(pack_str("default") for _ in range(6))
++        use_colors  = b''.join(pack_int(0) for _ in range(6))
++        colors      = b''.join(pack_int(0) for _ in range(6))
++        payload = (pack_str(self.name) + pack_str("") + pack_int(-1)
++                   + skin_names + use_colors + colors)
++        self._send_msg(self._game(CL_STARTINFO, payload))
++
++    def step_wait_ready_to_enter(self):
++        print("[bot] Waiting for SV_READYTOENTER...")
++        for _ in range(30):
++            ptype, chunks = self._recv()
++            if ptype == 'ctrl' and chunks and chunks[0][0] == NET_CTRLMSG_CLOSE:
++                raise RuntimeError("Server closed during wait")
++            if ptype != 'data': continue
++            for _, _, _, data in chunks:
++                mid, sys, _ = self._parse_msg(data)
++                if not sys and mid == SV_READYTOENTER:
++                    print("[bot]   SV_READYTOENTER received")
++                    return
++                elif sys and mid == NETMSG_PING:
++                    self._send_msg(self._sys(NETMSG_PING_REPLY))
++        raise RuntimeError("No SV_READYTOENTER")
++
++    def step_entergame(self):
++        print("[bot] Sending ENTERGAME...")
++        self._send_msg(self._sys(NETMSG_ENTERGAME))
++
++    # --- Input / movement ---
++    def _send_input(self, direction=0, jump=0, hook=0, fire=0,
++                    target_x=1, target_y=0, wanted_weapon=0):
++        """Send NETMSG_INPUT as a non-vital chunk (matches client behaviour)."""
++        # AckGameTick=-1 until we receive a snapshot
++        ack = self._ack_game_tick
++        pred = self._pred_tick
++
++        # CNetObj_PlayerInput has 10 int fields
++        input_size = 10 * 4   # 40 bytes
++        data = (self._sys(NETMSG_INPUT) +
++                pack_int(ack) +
++                pack_int(pred) +
++                pack_int(input_size) +
++                pack_int(direction) +
++                pack_int(target_x) +
++                pack_int(target_y) +
++                pack_int(jump) +
++                pack_int(fire) +
++                pack_int(hook) +
++                pack_int(0) +          # PlayerFlags
++                pack_int(wanted_weapon) +
++                pack_int(0) +          # NextWeapon
++                pack_int(0) +          # PrevWeapon
++                pack_int(0))           # PingCorrection
++        # Input is sent non-vital (no ack needed), one chunk per packet
++        chunk = self._pack_chunk(data, vital=False)
++        c = _huff.compress(chunk)
++        if len(c) < len(chunk):
++            self._send_raw(self._pack_hdr(NET_PACKETFLAG_COMPRESSION, 1) + c)
++        else:
++            self._send_raw(self._pack_hdr(0, 1) + chunk)
++
++    def _parse_snap_tick(self, mid, payload):
++        """Extract GameTick from SNAP / SNAPSINGLE / SNAPEMPTY."""
++        pos = 0
++        game_tick, pos = unpack_int(payload, pos)
++        _delta_base, pos = unpack_int(payload, pos)  # GameTick - DeltaTick
++        return game_tick
++
++    # --- Main loop ---
++    def run(self, duration=20):
++        self._ack_game_tick = -1
++        self._pred_tick     = 0
++
++        try:
++            self.step_token()
++            self.step_connect()
++            self.step_info()
++            self.step_wait_map()
++            self.step_download_map()
++            self.step_ready()
++            self.step_wait_con_ready()
++            self.step_startinfo()
++            self.step_wait_ready_to_enter()
++            self.step_entergame()
++
++            print(f"\n[bot] *** JOINED SERVER AS '{self.name}' ***")
++            print(f"[bot] Starting movement test...\n")
++
++            deadline     = time.time() + duration
++            last_ka      = time.time()
++            last_input   = time.time()
++            snaps        = 0
++
++            # Simple movement script: walk right 2s, jump, walk left 2s, repeat
++            def _direction_at(t):
++                phase = t % 8.0
++                if phase < 3.0:   return  1   # walk right
++                elif phase < 3.2: return  0   # pause before jump
++                elif phase < 5.0: return -1   # walk left
++                elif phase < 5.2: return  0
++                else:             return  1
++
++            def _jump_at(t):
++                phase = t % 8.0
++                return 1 if 3.0 <= phase < 3.5 else 0
++
++            start = time.time()
++            while time.time() < deadline:
++                now = time.time()
++
++                # Keepalive every 0.5s
++                if now - last_ka > 0.5:
++                    self._send_ctrl(NET_CTRLMSG_KEEPALIVE)
++                    last_ka = now
++
++                # Send input at ~25 Hz
++                if now - last_input > 0.04:
++                    elapsed  = now - start
++                    direction = _direction_at(elapsed)
++                    jump      = _jump_at(elapsed)
++                    target_x  = direction * 100 if direction else 1
++                    self._send_input(direction=direction, jump=jump,
++                                     target_x=target_x, target_y=0)
++                    last_input = now
++
++                ptype, chunks = self._recv(0.02)
++
++                if ptype == 'ctrl' and chunks and chunks[0][0] == NET_CTRLMSG_CLOSE:
++                    print("[bot] Server closed connection")
++                    break
++
++                if ptype != 'data':
++                    continue
++
++                for _, _, _, data in chunks:
++                    mid, sys, payload = self._parse_msg(data)
++                    if not sys:
++                        name = GAME_MSG_NAMES.get(mid, f'GAME_{mid}')
++                        if mid == SV_MOTD:
++                            msg, _ = unpack_str(payload)
++                            if msg: print(f"[bot] MOTD: {msg!r}")
++                        continue
++
++                    if mid in (NETMSG_SNAP, NETMSG_SNAPSINGLE, NETMSG_SNAPEMPTY):
++                        game_tick = self._parse_snap_tick(mid, payload)
++                        self._ack_game_tick = game_tick
++                        self._pred_tick     = game_tick + 2
++                        snaps += 1
++                        if snaps % 50 == 0:
++                            elapsed = time.time() - start
++                            print(f"[bot] t={elapsed:.1f}s  snap#{snaps}  tick={game_tick}"
++                                  f"  dir={_direction_at(elapsed):+d}"
++                                  f"  jump={_jump_at(elapsed)}")
++                    elif mid == NETMSG_PING:
++                        self._send_msg(self._sys(NETMSG_PING_REPLY))
++
++            print(f"\n[bot] Done. Received {snaps} snapshots in {duration}s.")
++
++        except Exception as e:
++            print(f"[bot] ERROR: {e}")
++            import traceback; traceback.print_exc()
++        finally:
++            self._send_ctrl(NET_CTRLMSG_CLOSE)
++            self.sock.close()
++            print("[bot] Disconnected.")
++
++
++if __name__ == '__main__':
++    import sys
++    host = sys.argv[1] if len(sys.argv) > 1 else '127.0.0.1'
++    port = int(sys.argv[2]) if len(sys.argv) > 2 else 8303
++    TeeBot(host, port, name='TeeBot').run(duration=15)
+diff --git a/rust_core_changes.patch b/rust_core_changes.patch
+index 7c288b7c..705e645f 100644
+--- a/rust_core_changes.patch
++++ b/rust_core_changes.patch
+@@ -1,581 +0,0 @@
+-diff --git a/src/rust_core/src/character_core/constants.rs b/src/rust_core/src/character_core/constants.rs
+-new file mode 100644
+-index 00000000..e35b1795
+---- /dev/null
+-+++ b/src/rust_core/src/character_core/constants.rs
+-@@ -0,0 +1,18 @@
+-+pub const PHYS_SIZE: f32 = 28.0;
+-+
+-+pub const SERVER_TICK_SPEED: i32 = 50;
+-+
+-+// Hook states — mirrors the C++ enum in gamecore.h
+-+pub const HOOK_RETRACTED: i32 = -1;
+-+pub const HOOK_IDLE: i32 = 0;
+-+pub const HOOK_RETRACT_START: i32 = 1;
+-+pub const HOOK_RETRACT_END: i32 = 3;
+-+pub const HOOK_FLYING: i32 = 4;
+-+pub const HOOK_GRABBED: i32 = 5;
+-+
+-+// Core event flags — generated from datasrc/network.py CoreEventFlags
+-+pub const COREEVENTFLAG_GROUND_JUMP: i32 = 1 << 0;
+-+pub const COREEVENTFLAG_AIR_JUMP: i32 = 1 << 1;
+-+pub const COREEVENTFLAG_HOOK_ATTACH_PLAYER: i32 = 1 << 2;
+-+pub const COREEVENTFLAG_HOOK_ATTACH_GROUND: i32 = 1 << 3;
+-+pub const COREEVENTFLAG_HOOK_HIT_NOHOOK: i32 = 1 << 4;
+-diff --git a/src/rust_core/src/character_core/character_core.rs b/src/rust_core/src/character_core/core.rs
+-similarity index 61%
+-rename from src/rust_core/src/character_core/character_core.rs
+-rename to src/rust_core/src/character_core/core.rs
+-index 881722f0..b40a2ffd 100644
+---- a/src/rust_core/src/character_core/character_core.rs
+-+++ b/src/rust_core/src/character_core/core.rs
+-@@ -1,10 +1,10 @@
+--// src/rust_core/character_core.rs
+--
+- use crate::vec2::Vec2;
+-+use crate::vec2::saturated_add;
+- use crate::world_core::WorldCore;
+- use crate::collision::Collision;
+- use crate::netobj::{NetObjCharacterCore, PlayerInput};
+--pub const PHYS_SIZE: f32 = 28.0;
+-+use super::constants::*;
+-+use super::helpers::{round_to_int, velocity_ramp};
+- 
+- pub struct CharacterCore<'a> {
+-     pub world: Option<&'a WorldCore>,
+-@@ -34,22 +34,18 @@ impl<'a> CharacterCore<'a> {
+-         Self {
+-             world: None,
+-             collision: None,
+--
+-             pos: Vec2::zero(),
+-             vel: Vec2::zero(),
+--
+-             hook_drag_vel: Vec2::zero(),
+-             hook_pos: Vec2::zero(),
+-             hook_dir: Vec2::zero(),
+-             hook_tick: 0,
+-             hook_state: 0,
+-             hooked_player: -1,
+--
+-             jumped: 0,
+-             direction: 0,
+-             angle: 0,
+-             death: false,
+--
+-             input: PlayerInput::default(),
+-             triggered_events: 0,
+-         }
+-@@ -76,7 +72,7 @@ impl<'a> CharacterCore<'a> {
+- 
+-     pub fn add_drag_velocity(&mut self) {
+-         if let Some(world) = self.world {
+--            let ds = world.tuning().hook_drag_speed;
+-+            let ds = world.tuning.hook_drag_speed;
+-             self.vel.x = saturated_add(-ds, ds, self.vel.x, self.hook_drag_vel.x);
+-             self.vel.y = saturated_add(-ds, ds, self.vel.y, self.hook_drag_vel.y);
+-         }
+-@@ -89,19 +85,14 @@ impl<'a> CharacterCore<'a> {
+-     pub fn write_netobj(&self, out: &mut NetObjCharacterCore) {
+-         out.m_x = round_to_int(self.pos.x);
+-         out.m_y = round_to_int(self.pos.y);
+--
+--        // velocity is scaled by 256 like in C++
+-         out.m_vel_x = round_to_int(self.vel.x * 256.0);
+-         out.m_vel_y = round_to_int(self.vel.y * 256.0);
+--
+-         out.m_hook_state = self.hook_state;
+-         out.m_hook_tick = self.hook_tick;
+-         out.m_hook_x = round_to_int(self.hook_pos.x);
+-         out.m_hook_y = round_to_int(self.hook_pos.y);
+--
+-         out.m_hook_dx = round_to_int(self.hook_dir.x * 256.0);
+-         out.m_hook_dy = round_to_int(self.hook_dir.y * 256.0);
+--
+-         out.m_hooked_player = self.hooked_player;
+-         out.m_jumped = self.jumped;
+-         out.m_direction = self.direction;
+-@@ -109,68 +100,63 @@ impl<'a> CharacterCore<'a> {
+-     }
+- 
+-     pub fn read_netobj(&mut self, obj: &NetObjCharacterCore) {
+--        // position
+-         self.pos.x = obj.m_x as f32;
+-         self.pos.y = obj.m_y as f32;
+--
+--        // velocity scaled back down
+-         self.vel.x = (obj.m_vel_x as f32) / 256.0;
+-         self.vel.y = (obj.m_vel_y as f32) / 256.0;
+--
+-         self.hook_state = obj.m_hook_state;
+-         self.hook_tick = obj.m_hook_tick;
+--
+-         self.hook_pos.x = obj.m_hook_x as f32;
+-         self.hook_pos.y = obj.m_hook_y as f32;
+--
+--        // hook dir scaled
+-         self.hook_dir.x = (obj.m_hook_dx as f32) / 256.0;
+-         self.hook_dir.y = (obj.m_hook_dy as f32) / 256.0;
+--
+-         self.hooked_player = obj.m_hooked_player;
+-         self.jumped = obj.m_jumped;
+-         self.direction = obj.m_direction;
+-         self.angle = obj.m_angle;
+-     }
+- 
+-+    pub fn quantize(&mut self) {
+-+        let mut tmp = NetObjCharacterCore {
+-+            m_x: 0, m_y: 0, m_vel_x: 0, m_vel_y: 0,
+-+            m_hook_state: 0, m_hook_tick: 0,
+-+            m_hook_x: 0, m_hook_y: 0, m_hook_dx: 0, m_hook_dy: 0,
+-+            m_hooked_player: 0, m_jumped: 0, m_direction: 0, m_angle: 0,
+-+        };
+-+        self.write_netobj(&mut tmp);
+-+        self.read_netobj(&tmp);
+-+    }
+-+
+-     pub fn tick(&mut self, use_input: bool) {
+-         self.triggered_events = 0;
+- 
+--        // grounded check
+-         let grounded = if let Some(collision) = self.collision {
+--            collision.check_point(self.pos.x + PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0) ||
+--                collision.check_point(self.pos.x - PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
+-+            collision.check_point(self.pos.x + PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
+-+                || collision.check_point(self.pos.x - PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
+-         } else {
+-             false
+-         };
+- 
+-         let target_dir = self.input.get_target_direction();
+- 
+--        // gravity
+-         if let Some(world) = self.world {
+-             self.vel.y += world.tuning.gravity;
+-         }
+- 
+--        let (max_speed, accel, friction) = if grounded {
+--            if let Some(world) = self.world {
+-+        let (max_speed, accel, friction) = if let Some(world) = self.world {
+-+            if grounded {
+-                 (world.tuning.ground_control_speed, world.tuning.ground_control_accel, world.tuning.ground_friction)
+-             } else {
+--                (1.0, 1.0, 1.0) // fallback
+--            }
+--        } else {
+--            if let Some(world) = self.world {
+-                 (world.tuning.air_control_speed, world.tuning.air_control_accel, world.tuning.air_friction)
+--            } else {
+--                (1.0, 1.0, 1.0)
+-             }
+-+        } else {
+-+            (1.0, 1.0, 1.0)
+-         };
+- 
+--        // handle input
+-         if use_input {
+-             self.direction = self.input.direction;
+-             self.angle = (target_dir.angle() * 256.0) as i32;
+- 
+--            // jumping
+-             if self.input.jump {
+-                 if self.jumped & 1 == 0 {
+-                     if grounded {
+-@@ -191,7 +177,6 @@ impl<'a> CharacterCore<'a> {
+-                 self.jumped &= !1;
+-             }
+- 
+--            // hook input
+-             if self.input.hook {
+-                 if self.hook_state == HOOK_IDLE {
+-                     self.hook_state = HOOK_FLYING;
+-@@ -207,7 +192,6 @@ impl<'a> CharacterCore<'a> {
+-             }
+-         }
+- 
+--        // movement
+-         if self.direction < 0 {
+-             self.vel.x = saturated_add(-max_speed, max_speed, self.vel.x, -accel);
+-         }
+-@@ -222,87 +206,130 @@ impl<'a> CharacterCore<'a> {
+-             self.jumped &= !2;
+-         }
+- 
+--        // handle hook
+-         self.update_hook();
+- 
+--        // clamp velocity
+-         if self.vel.length() > 6000.0 {
+-             self.vel = self.vel.normalize() * 6000.0;
+-         }
+-     }
+- 
+-     pub fn move_core(&mut self) {
+--        if self.world.is_none() {
+-+        if self.world.is_none() || self.collision.is_none() {
+-             return;
+-         }
+- 
+--        // velocity ramp like C++ version
+--        if let Some(world) = self.world {
+--            let ramp = velocity_ramp(self.vel.length() * 50.0,
+--                                     world.tuning.velramp_start,
+--                                     world.tuning.velramp_range,
+--                                     world.tuning.velramp_curvature);
+--            self.vel.x *= ramp;
+--        }
+-+        let ramp = if let Some(world) = self.world {
+-+            velocity_ramp(
+-+                self.vel.length() * 50.0,
+-+                world.tuning.velramp_start,
+-+                world.tuning.velramp_range,
+-+                world.tuning.velramp_curvature,
+-+            )
+-+        } else {
+-+            1.0
+-+        };
+-+        self.vel.x *= ramp;
+- 
+--        // move using collision system
+-         if let Some(collision) = self.collision {
+-             let mut new_pos = self.pos;
+--            collision.move_box(&mut new_pos, &mut self.vel, Vec2 { x: PHYS_SIZE, y: PHYS_SIZE }, 0, self.death);
+-+            collision.move_box(
+-+                &mut new_pos,
+-+                &mut self.vel,
+-+                Vec2 { x: PHYS_SIZE, y: PHYS_SIZE },
+-+                0.0,
+-+                Some(&mut self.death),
+-+            );
+-             self.pos = new_pos;
+-         }
+- 
+--        // restore velocity x after ramp
+--        if let Some(world) = self.world {
+--            let ramp = velocity_ramp(self.vel.length() * 50.0,
+--                                     world.tuning.velramp_start,
+--                                     world.tuning.velramp_range,
+--                                     world.tuning.velramp_curvature);
+-+        let ramp = if let Some(world) = self.world {
+-+            velocity_ramp(
+-+                self.vel.length() * 50.0,
+-+                world.tuning.velramp_start,
+-+                world.tuning.velramp_range,
+-+                world.tuning.velramp_curvature,
+-+            )
+-+        } else {
+-+            1.0
+-+        };
+-+        if ramp != 0.0 {
+-             self.vel.x *= 1.0 / ramp;
+-         }
+-     }
+--    /// Same as CCharacterCore::Quantize — write then read on local object
+--    pub fn quantize(&mut self) {
+--        // create temporary network object
+--        let mut tmp = NetObjCharacterCore {
+--            m_x: 0,
+--            m_y: 0,
+--            m_vel_x: 0,
+--            m_vel_y: 0,
+--            m_hook_state: 0,
+--            m_hook_tick: 0,
+--            m_hook_x: 0,
+--            m_hook_y: 0,
+--            m_hook_dx: 0,
+--            m_hook_dy: 0,
+--            m_hooked_player: 0,
+--            m_jumped: 0,
+--            m_direction: 0,
+--            m_angle: 0,
+--        };
+- 
+--        // serialize current state
+--        self.write_netobj(&mut tmp);
+--        // read it back to truncate/quantize floats
+--        self.read_netobj(&tmp);
+--    }
+--}
+-+    fn update_hook(&mut self) {
+-+        if self.hook_state == HOOK_IDLE {
+-+            self.hooked_player = -1;
+-+            self.hook_pos = self.pos;
+-+            return;
+-+        }
+- 
+--pub fn saturated_add(min: f32, max: f32, current: f32, add: f32) -> f32 {
+--    (current + add).clamp(min, max)
+--}
+-+        if self.hook_state >= HOOK_RETRACT_START && self.hook_state < HOOK_RETRACT_END {
+-+            self.hook_state += 1;
+-+            return;
+-+        }
+- 
+--// convert float -> rounded int
+--fn round_to_int(f: f32) -> i32 {
+--    f.round() as i32
+--}
+-+        if self.hook_state == HOOK_RETRACT_END {
+-+            self.hook_state = HOOK_RETRACTED;
+-+            return;
+-+        }
+- 
+--pub fn velocity_ramp(value: f32, start: f32, range: f32, curvature: f32) -> f32 {
+--    if value < start {
+--        1.0
+--    } else if value > start + range {
+--        1.0 + curvature
+--    } else {
+--        1.0 + curvature * ((value - start) / range)
+-+        let (hook_fire_speed, hook_length, hook_drag_accel, hook_drag_speed) =
+-+            if let Some(world) = self.world {
+-+                (
+-+                    world.tuning.hook_fire_speed,
+-+                    world.tuning.hook_length,
+-+                    world.tuning.hook_drag_accel,
+-+                    world.tuning.hook_drag_speed,
+-+                )
+-+            } else {
+-+                return;
+-+            };
+-+
+-+        if self.hook_state == HOOK_FLYING {
+-+            let mut new_pos = self.hook_pos + self.hook_dir * hook_fire_speed;
+-+
+-+            if self.pos.distance(&new_pos) > hook_length {
+-+                self.hook_state = HOOK_RETRACT_START;
+-+                new_pos = self.pos + (new_pos - self.pos).normalize() * hook_length;
+-+            }
+-+
+-+            if let Some(collision) = self.collision {
+-+                let (hit_ground, hit_nohook, clipped) =
+-+                    collision.intersect_line(self.hook_pos, new_pos);
+-+
+-+                if self.hook_state == HOOK_FLYING {
+-+                    if hit_ground {
+-+                        self.triggered_events |= COREEVENTFLAG_HOOK_ATTACH_GROUND;
+-+                        self.hook_state = HOOK_GRABBED;
+-+                    } else if hit_nohook {
+-+                        self.triggered_events |= COREEVENTFLAG_HOOK_HIT_NOHOOK;
+-+                        self.hook_state = HOOK_RETRACT_START;
+-+                    }
+-+                    self.hook_pos = clipped;
+-+                }
+-+            } else {
+-+                self.hook_pos = new_pos;
+-+            }
+-+        } else if self.hook_state == HOOK_GRABBED && self.hooked_player == -1 {
+-+            let diff = self.hook_pos - self.pos;
+-+            let dist = diff.length();
+-+
+-+            if dist > 46.0 {
+-+                let dir = diff.normalize();
+-+                self.hook_drag_vel = self.hook_drag_vel + dir * hook_drag_accel;
+-+                let len = self.hook_drag_vel.length();
+-+                if len > hook_drag_speed {
+-+                    self.hook_drag_vel = self.hook_drag_vel * (hook_drag_speed / len);
+-+                }
+-+            }
+-+
+-+            self.hook_tick += 1;
+-+            if self.hook_tick > SERVER_TICK_SPEED + SERVER_TICK_SPEED / 5 || dist < 46.0 {
+-+                self.hook_drag_vel = Vec2::zero();
+-+                self.hook_state = HOOK_RETRACTED;
+-+                self.hook_pos = self.pos;
+-+            }
+-+        }
+-     }
+--}
+-\ No newline at end of file
+-+}
+-diff --git a/src/rust_core/src/character_core/helpers.rs b/src/rust_core/src/character_core/helpers.rs
+-new file mode 100644
+-index 00000000..a03ebf07
+---- /dev/null
+-+++ b/src/rust_core/src/character_core/helpers.rs
+-@@ -0,0 +1,13 @@
+-+pub fn round_to_int(f: f32) -> i32 {
+-+    f.round() as i32
+-+}
+-+
+-+pub fn velocity_ramp(value: f32, start: f32, range: f32, curvature: f32) -> f32 {
+-+    if value < start {
+-+        1.0
+-+    } else if value > start + range {
+-+        1.0 + curvature
+-+    } else {
+-+        1.0 + curvature * ((value - start) / range)
+-+    }
+-+}
+-diff --git a/src/rust_core/src/character_core/mod.rs b/src/rust_core/src/character_core/mod.rs
+-index f2049611..19bdb27a 100644
+---- a/src/rust_core/src/character_core/mod.rs
+-+++ b/src/rust_core/src/character_core/mod.rs
+-@@ -1 +1,6 @@
+--pub mod character_core;
+-\ No newline at end of file
+-+pub mod constants;
+-+mod helpers;
+-+pub mod core;
+-+
+-+pub use constants::*;
+-+pub use core::CharacterCore;
+-diff --git a/src/rust_core/src/collision.rs b/src/rust_core/src/collision.rs
+-index a1a87469..49f469d9 100644
+---- a/src/rust_core/src/collision.rs
+-+++ b/src/rust_core/src/collision.rs
+-@@ -1,19 +1,44 @@
+- use crate::vec2::Vec2;
+- 
+--// src/collision.rs
+-+pub const COLFLAG_SOLID: i32 = 1;
+-+pub const COLFLAG_DEATH: i32 = 2;
+-+pub const COLFLAG_NOHOOK: i32 = 4;
+-+
+- #[derive(Debug)]
+- pub struct Collision {
+--    // các field tạm
+-+    // tile map data will go here
+- }
+- 
+- impl Collision {
+-+    pub fn new() -> Self {
+-+        Self {}
+-+    }
+-+
+-+    pub fn check_point(&self, _x: f32, _y: f32) -> bool {
+-+        false
+-+    }
+-+
+-+    pub fn check_point_flag(&self, _x: f32, _y: f32, _flag: i32) -> bool {
+-+        false
+-+    }
+-+
+-+    /// Returns (hit_ground, hit_nohook, new_end_pos).
+-+    /// Stub: always returns no hit.
+-+    pub fn intersect_line(&self, _p0: Vec2, p1: Vec2) -> (bool, bool, Vec2) {
+-+        (false, false, p1)
+-+    }
+-+
+-+    pub fn test_box(&self, _pos: Vec2, _size: Vec2, _col_flags: i32) -> bool {
+-+        false
+-+    }
+-+
+-     pub fn move_box(
+-         &self,
+-         inout_pos: &mut Vec2,
+-         inout_vel: &mut Vec2,
+-         size: Vec2,
+-         elasticity: f32,
+--        mut death: Option<&mut bool>, // <- mutable ở đây
+-+        mut death: Option<&mut bool>,
+-     ) {
+-         let mut pos = *inout_pos;
+-         let mut vel = *inout_vel;
+-@@ -22,7 +47,7 @@ impl Collision {
+-         let max_steps = distance as i32;
+- 
+-         if let Some(d) = death.as_mut() {
+--            *d = false;
+-+            **d = false;
+-         }
+- 
+-         if distance > 0.00001 {
+-@@ -35,7 +60,7 @@ impl Collision {
+- 
+-                 if let Some(d) = death.as_mut() {
+-                     if self.test_box(new_pos, size * (2.0 / 3.0), COLFLAG_DEATH) {
+--                        *d = true;
+-+                        **d = true;
+-                     }
+-                 }
+- 
+-@@ -69,13 +94,4 @@ impl Collision {
+-         *inout_pos = pos;
+-         *inout_vel = vel;
+-     }
+--
+--    // Thêm stub cho test_box
+--    fn test_box(&self, _pos: Vec2, _size: Vec2, _col_flags: i32) -> bool {
+--        // logic collision thực tế sẽ được implement sau
+--        false
+--    }
+- }
+--
+--// Constants tương ứng với C++ code
+--const COLFLAG_DEATH: i32 = 1;
+-\ No newline at end of file
+-diff --git a/src/rust_core/src/lib.rs b/src/rust_core/src/lib.rs
+-index 35ddf6f1..8bfba50d 100644
+---- a/src/rust_core/src/lib.rs
+-+++ b/src/rust_core/src/lib.rs
+-@@ -3,4 +3,4 @@ pub mod world_core;
+- pub mod collision;
+- pub mod netobj;
+- pub mod character_core;
+--mod vec2;
+-+pub mod vec2;
+-diff --git a/src/rust_core/src/netobj.rs b/src/rust_core/src/netobj.rs
+-index c2ab2256..b0b8f921 100644
+---- a/src/rust_core/src/netobj.rs
+-+++ b/src/rust_core/src/netobj.rs
+-@@ -1,14 +1,12 @@
+--// src/netobj.rs
+-+use crate::vec2::Vec2;
+- 
+- #[repr(C)]
+- #[derive(Debug, Clone, Copy)]
+- pub struct NetObjCharacterCore {
+-     pub m_x: i32,
+-     pub m_y: i32,
+--
+-     pub m_vel_x: i32,
+-     pub m_vel_y: i32,
+--
+-     pub m_hook_state: i32,
+-     pub m_hook_tick: i32,
+-     pub m_hook_x: i32,
+-@@ -16,7 +14,6 @@ pub struct NetObjCharacterCore {
+-     pub m_hook_dx: i32,
+-     pub m_hook_dy: i32,
+-     pub m_hooked_player: i32,
+--
+-     pub m_jumped: i32,
+-     pub m_direction: i32,
+-     pub m_angle: i32,
+-@@ -24,9 +21,17 @@ pub struct NetObjCharacterCore {
+- 
+- #[derive(Debug, Default, Clone, Copy)]
+- pub struct PlayerInput {
+--    pub m_TargetX: i32,
+--    pub m_TargetY: i32,
+--    pub m_Direction: i32,
+--    pub m_Jump: bool,
+--    pub m_Hook: bool,
+--}
+-\ No newline at end of file
+-+    pub target_x: i32,
+-+    pub target_y: i32,
+-+    pub direction: i32,
+-+    pub jump: bool,
+-+    pub hook: bool,
+-+}
+-+
+-+impl PlayerInput {
+-+    pub fn get_target_direction(&self) -> Vec2 {
+-+        let v = Vec2 { x: self.target_x as f32, y: self.target_y as f32 };
+-+        let len = v.length();
+-+        if len > 0.0001 { v * (1.0 / len) } else { Vec2 { x: 0.0, y: -1.0 } }
+-+    }
+-+}
+-diff --git a/src/rust_core/src/world_core.rs b/src/rust_core/src/world_core.rs
+-index e1f6739d..e80c232e 100644
+---- a/src/rust_core/src/world_core.rs
+-+++ b/src/rust_core/src/world_core.rs
+-@@ -1,6 +1,5 @@
+- // src/world_core.rs
+- 
+--use crate::vec2;
+- 
+- #[derive(Debug, Clone, Copy)]
+- pub struct Tuning {
+diff --git a/src/rust_core/src/character_core/constants.rs b/src/rust_core/src/character_core/constants.rs
+index e35b1795..27f54b6f 100644
+--- a/src/rust_core/src/character_core/constants.rs
 +++ b/src/rust_core/src/character_core/constants.rs
-@@ -0,0 +1,18 @@
-+pub const PHYS_SIZE: f32 = 28.0;
-+
-+pub const SERVER_TICK_SPEED: i32 = 50;
-+
-+// Hook states — mirrors the C++ enum in gamecore.h
-+pub const HOOK_RETRACTED: i32 = -1;
-+pub const HOOK_IDLE: i32 = 0;
-+pub const HOOK_RETRACT_START: i32 = 1;
-+pub const HOOK_RETRACT_END: i32 = 3;
-+pub const HOOK_FLYING: i32 = 4;
-+pub const HOOK_GRABBED: i32 = 5;
-+
-+// Core event flags — generated from datasrc/network.py CoreEventFlags
-+pub const COREEVENTFLAG_GROUND_JUMP: i32 = 1 << 0;
-+pub const COREEVENTFLAG_AIR_JUMP: i32 = 1 << 1;
-+pub const COREEVENTFLAG_HOOK_ATTACH_PLAYER: i32 = 1 << 2;
-+pub const COREEVENTFLAG_HOOK_ATTACH_GROUND: i32 = 1 << 3;
-+pub const COREEVENTFLAG_HOOK_HIT_NOHOOK: i32 = 1 << 4;
-diff --git a/src/rust_core/src/character_core/character_core.rs b/src/rust_core/src/character_core/core.rs
-similarity index 61%
-rename from src/rust_core/src/character_core/character_core.rs
-rename to src/rust_core/src/character_core/core.rs
-index 881722f0..b40a2ffd 100644
---- a/src/rust_core/src/character_core/character_core.rs
-+++ b/src/rust_core/src/character_core/core.rs
-@@ -1,10 +1,10 @@
--// src/rust_core/character_core.rs
+@@ -1,8 +1,8 @@
+ pub const PHYS_SIZE: f32 = 28.0;
 -
- use crate::vec2::Vec2;
-+use crate::vec2::saturated_add;
++pub const MAX_CLIENTS: usize = 64;
+ pub const SERVER_TICK_SPEED: i32 = 50;
+ 
+-// Hook states — mirrors the C++ enum in gamecore.h
++// Hook states — mirrors C++ enum in gamecore.h
+ pub const HOOK_RETRACTED: i32 = -1;
+ pub const HOOK_IDLE: i32 = 0;
+ pub const HOOK_RETRACT_START: i32 = 1;
+@@ -10,7 +10,7 @@ pub const HOOK_RETRACT_END: i32 = 3;
+ pub const HOOK_FLYING: i32 = 4;
+ pub const HOOK_GRABBED: i32 = 5;
+ 
+-// Core event flags — generated from datasrc/network.py CoreEventFlags
++// Core event flags — from datasrc/network.py CoreEventFlags
+ pub const COREEVENTFLAG_GROUND_JUMP: i32 = 1 << 0;
+ pub const COREEVENTFLAG_AIR_JUMP: i32 = 1 << 1;
+ pub const COREEVENTFLAG_HOOK_ATTACH_PLAYER: i32 = 1 << 2;
+diff --git a/src/rust_core/src/character_core/core.rs b/src/rust_core/src/character_core/core.rs
+index b40a2ffd..9199a2f3 100644
+--- a/src/rust_core/src/character_core/core.rs
++++ b/src/rust_core/src/character_core/core.rs
+@@ -1,14 +1,15 @@
+-use crate::vec2::Vec2;
+-use crate::vec2::saturated_add;
++use crate::vec2::{Vec2, saturated_add};
  use crate::world_core::WorldCore;
  use crate::collision::Collision;
  use crate::netobj::{NetObjCharacterCore, PlayerInput};
--pub const PHYS_SIZE: f32 = 28.0;
-+use super::constants::*;
-+use super::helpers::{round_to_int, velocity_ramp};
+ use super::constants::*;
+-use super::helpers::{round_to_int, velocity_ramp};
++use super::helpers::{round_to_int, velocity_ramp, dot, mix, closest_point_on_line};
  
- pub struct CharacterCore<'a> {
-     pub world: Option<&'a WorldCore>,
-@@ -34,22 +34,18 @@ impl<'a> CharacterCore<'a> {
+-pub struct CharacterCore<'a> {
+-    pub world: Option<&'a WorldCore>,
+-    pub collision: Option<&'a Collision>,
++pub struct CharacterCore {
++    /// Raw pointer to the shared WorldCore. Must be set via init() before tick/move.
++    pub world: *mut WorldCore,
++    /// Raw pointer to the Collision instance. Must be set via init() before tick/move.
++    pub collision: *mut Collision,
+ 
+     pub pos: Vec2,
+     pub vel: Vec2,
+@@ -29,11 +30,14 @@ pub struct CharacterCore<'a> {
+     pub triggered_events: i32,
+ }
+ 
+-impl<'a> CharacterCore<'a> {
++// SAFETY: CharacterCore is used single-threaded in the game loop.
++unsafe impl Send for CharacterCore {}
++
++impl CharacterCore {
+     pub fn new() -> Self {
          Self {
-             world: None,
-             collision: None,
--
+-            world: None,
+-            collision: None,
++            world: std::ptr::null_mut(),
++            collision: std::ptr::null_mut(),
              pos: Vec2::zero(),
              vel: Vec2::zero(),
--
              hook_drag_vel: Vec2::zero(),
-             hook_pos: Vec2::zero(),
-             hook_dir: Vec2::zero(),
-             hook_tick: 0,
-             hook_state: 0,
-             hooked_player: -1,
--
-             jumped: 0,
-             direction: 0,
-             angle: 0,
-             death: false,
--
-             input: PlayerInput::default(),
-             triggered_events: 0,
+@@ -51,9 +55,9 @@ impl<'a> CharacterCore<'a> {
          }
-@@ -76,7 +72,7 @@ impl<'a> CharacterCore<'a> {
+     }
+ 
+-    pub fn init(&mut self, world: &'a WorldCore, collision: &'a Collision) {
+-        self.world = Some(world);
+-        self.collision = Some(collision);
++    pub fn init(&mut self, world: &mut WorldCore, collision: &mut Collision) {
++        self.world = world as *mut _;
++        self.collision = collision as *mut _;
+     }
+ 
+     pub fn reset(&mut self) {
+@@ -71,11 +75,13 @@ impl<'a> CharacterCore<'a> {
+     }
  
      pub fn add_drag_velocity(&mut self) {
-         if let Some(world) = self.world {
--            let ds = world.tuning().hook_drag_speed;
-+            let ds = world.tuning.hook_drag_speed;
-             self.vel.x = saturated_add(-ds, ds, self.vel.x, self.hook_drag_vel.x);
-             self.vel.y = saturated_add(-ds, ds, self.vel.y, self.hook_drag_vel.y);
-         }
-@@ -89,19 +85,14 @@ impl<'a> CharacterCore<'a> {
-     pub fn write_netobj(&self, out: &mut NetObjCharacterCore) {
-         out.m_x = round_to_int(self.pos.x);
-         out.m_y = round_to_int(self.pos.y);
--
--        // velocity is scaled by 256 like in C++
-         out.m_vel_x = round_to_int(self.vel.x * 256.0);
-         out.m_vel_y = round_to_int(self.vel.y * 256.0);
--
-         out.m_hook_state = self.hook_state;
-         out.m_hook_tick = self.hook_tick;
-         out.m_hook_x = round_to_int(self.hook_pos.x);
-         out.m_hook_y = round_to_int(self.hook_pos.y);
--
-         out.m_hook_dx = round_to_int(self.hook_dir.x * 256.0);
-         out.m_hook_dy = round_to_int(self.hook_dir.y * 256.0);
--
-         out.m_hooked_player = self.hooked_player;
-         out.m_jumped = self.jumped;
-         out.m_direction = self.direction;
-@@ -109,68 +100,63 @@ impl<'a> CharacterCore<'a> {
-     }
- 
-     pub fn read_netobj(&mut self, obj: &NetObjCharacterCore) {
--        // position
-         self.pos.x = obj.m_x as f32;
-         self.pos.y = obj.m_y as f32;
--
--        // velocity scaled back down
-         self.vel.x = (obj.m_vel_x as f32) / 256.0;
-         self.vel.y = (obj.m_vel_y as f32) / 256.0;
--
-         self.hook_state = obj.m_hook_state;
-         self.hook_tick = obj.m_hook_tick;
--
-         self.hook_pos.x = obj.m_hook_x as f32;
-         self.hook_pos.y = obj.m_hook_y as f32;
--
--        // hook dir scaled
-         self.hook_dir.x = (obj.m_hook_dx as f32) / 256.0;
-         self.hook_dir.y = (obj.m_hook_dy as f32) / 256.0;
--
-         self.hooked_player = obj.m_hooked_player;
-         self.jumped = obj.m_jumped;
-         self.direction = obj.m_direction;
-         self.angle = obj.m_angle;
-     }
- 
-+    pub fn quantize(&mut self) {
-+        let mut tmp = NetObjCharacterCore {
-+            m_x: 0, m_y: 0, m_vel_x: 0, m_vel_y: 0,
-+            m_hook_state: 0, m_hook_tick: 0,
-+            m_hook_x: 0, m_hook_y: 0, m_hook_dx: 0, m_hook_dy: 0,
-+            m_hooked_player: 0, m_jumped: 0, m_direction: 0, m_angle: 0,
+-        if let Some(world) = self.world {
+-            let ds = world.tuning.hook_drag_speed;
+-            self.vel.x = saturated_add(-ds, ds, self.vel.x, self.hook_drag_vel.x);
+-            self.vel.y = saturated_add(-ds, ds, self.vel.y, self.hook_drag_vel.y);
+-        }
++        let world = match unsafe { self.world.as_ref() } {
++            Some(w) => w,
++            None => return,
 +        };
-+        self.write_netobj(&mut tmp);
-+        self.read_netobj(&tmp);
-+    }
-+
++        let ds = world.tuning.hook_drag_speed;
++        self.vel.x = saturated_add(-ds, ds, self.vel.x, self.hook_drag_vel.x);
++        self.vel.y = saturated_add(-ds, ds, self.vel.y, self.hook_drag_vel.y);
+     }
+ 
+     pub fn reset_drag_velocity(&mut self) {
+@@ -127,30 +133,31 @@ impl<'a> CharacterCore<'a> {
+         self.read_netobj(&tmp);
+     }
+ 
++    /// Mirrors C++ CCharacterCore::Tick(bool UseInput).
      pub fn tick(&mut self, use_input: bool) {
++        let world = match unsafe { self.world.as_ref() } {
++            Some(w) => w,
++            None => return,
++        };
++        let collision = match unsafe { self.collision.as_ref() } {
++            Some(c) => c,
++            None => return,
++        };
++
          self.triggered_events = 0;
  
--        // grounded check
-         let grounded = if let Some(collision) = self.collision {
--            collision.check_point(self.pos.x + PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0) ||
--                collision.check_point(self.pos.x - PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
-+            collision.check_point(self.pos.x + PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
-+                || collision.check_point(self.pos.x - PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
-         } else {
-             false
-         };
+-        let grounded = if let Some(collision) = self.collision {
++        let grounded =
+             collision.check_point(self.pos.x + PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
+-                || collision.check_point(self.pos.x - PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0)
+-        } else {
+-            false
+-        };
++            || collision.check_point(self.pos.x - PHYS_SIZE / 2.0, self.pos.y + PHYS_SIZE / 2.0 + 5.0);
  
          let target_dir = self.input.get_target_direction();
  
--        // gravity
-         if let Some(world) = self.world {
-             self.vel.y += world.tuning.gravity;
-         }
+-        if let Some(world) = self.world {
+-            self.vel.y += world.tuning.gravity;
+-        }
++        self.vel.y += world.tuning.gravity;
  
--        let (max_speed, accel, friction) = if grounded {
--            if let Some(world) = self.world {
-+        let (max_speed, accel, friction) = if let Some(world) = self.world {
-+            if grounded {
-                 (world.tuning.ground_control_speed, world.tuning.ground_control_accel, world.tuning.ground_friction)
-             } else {
--                (1.0, 1.0, 1.0) // fallback
--            }
--        } else {
--            if let Some(world) = self.world {
-                 (world.tuning.air_control_speed, world.tuning.air_control_accel, world.tuning.air_friction)
+-        let (max_speed, accel, friction) = if let Some(world) = self.world {
+-            if grounded {
+-                (world.tuning.ground_control_speed, world.tuning.ground_control_accel, world.tuning.ground_friction)
 -            } else {
--                (1.0, 1.0, 1.0)
-             }
-+        } else {
-+            (1.0, 1.0, 1.0)
+-                (world.tuning.air_control_speed, world.tuning.air_control_accel, world.tuning.air_friction)
+-            }
++        let (max_speed, accel, friction) = if grounded {
++            (world.tuning.ground_control_speed, world.tuning.ground_control_accel, world.tuning.ground_friction)
+         } else {
+-            (1.0, 1.0, 1.0)
++            (world.tuning.air_control_speed, world.tuning.air_control_accel, world.tuning.air_friction)
          };
  
--        // handle input
          if use_input {
-             self.direction = self.input.direction;
-             self.angle = (target_dir.angle() * 256.0) as i32;
- 
--            // jumping
-             if self.input.jump {
+@@ -161,15 +168,11 @@ impl<'a> CharacterCore<'a> {
                  if self.jumped & 1 == 0 {
                      if grounded {
-@@ -191,7 +177,6 @@ impl<'a> CharacterCore<'a> {
-                 self.jumped &= !1;
-             }
- 
--            // hook input
-             if self.input.hook {
-                 if self.hook_state == HOOK_IDLE {
-                     self.hook_state = HOOK_FLYING;
-@@ -207,7 +192,6 @@ impl<'a> CharacterCore<'a> {
-             }
-         }
- 
--        // movement
-         if self.direction < 0 {
-             self.vel.x = saturated_add(-max_speed, max_speed, self.vel.x, -accel);
-         }
-@@ -222,87 +206,130 @@ impl<'a> CharacterCore<'a> {
+                         self.triggered_events |= COREEVENTFLAG_GROUND_JUMP;
+-                        if let Some(world) = self.world {
+-                            self.vel.y = -world.tuning.ground_jump_impulse;
+-                        }
++                        self.vel.y = -world.tuning.ground_jump_impulse;
+                         self.jumped |= 1;
+                     } else if self.jumped & 2 == 0 {
+                         self.triggered_events |= COREEVENTFLAG_AIR_JUMP;
+-                        if let Some(world) = self.world {
+-                            self.vel.y = -world.tuning.air_jump_impulse;
+-                        }
++                        self.vel.y = -world.tuning.air_jump_impulse;
+                         self.jumped |= 3;
+                     }
+                 }
+@@ -206,130 +209,236 @@ impl<'a> CharacterCore<'a> {
              self.jumped &= !2;
          }
  
--        // handle hook
-         self.update_hook();
+-        self.update_hook();
++        // ---- Hook state machine (mirrors C++ CCharacterCore::Tick inline) ----
  
--        // clamp velocity
-         if self.vel.length() > 6000.0 {
-             self.vel = self.vel.normalize() * 6000.0;
-         }
-     }
- 
-     pub fn move_core(&mut self) {
--        if self.world.is_none() {
-+        if self.world.is_none() || self.collision.is_none() {
-             return;
-         }
- 
--        // velocity ramp like C++ version
--        if let Some(world) = self.world {
--            let ramp = velocity_ramp(self.vel.length() * 50.0,
--                                     world.tuning.velramp_start,
--                                     world.tuning.velramp_range,
--                                     world.tuning.velramp_curvature);
--            self.vel.x *= ramp;
+-        if self.vel.length() > 6000.0 {
+-            self.vel = self.vel.normalize() * 6000.0;
 -        }
-+        let ramp = if let Some(world) = self.world {
-+            velocity_ramp(
-+                self.vel.length() * 50.0,
-+                world.tuning.velramp_start,
-+                world.tuning.velramp_range,
-+                world.tuning.velramp_curvature,
-+            )
-+        } else {
-+            1.0
-+        };
-+        self.vel.x *= ramp;
- 
--        // move using collision system
-         if let Some(collision) = self.collision {
-             let mut new_pos = self.pos;
--            collision.move_box(&mut new_pos, &mut self.vel, Vec2 { x: PHYS_SIZE, y: PHYS_SIZE }, 0, self.death);
-+            collision.move_box(
-+                &mut new_pos,
-+                &mut self.vel,
-+                Vec2 { x: PHYS_SIZE, y: PHYS_SIZE },
-+                0.0,
-+                Some(&mut self.death),
-+            );
-             self.pos = new_pos;
-         }
- 
--        // restore velocity x after ramp
--        if let Some(world) = self.world {
--            let ramp = velocity_ramp(self.vel.length() * 50.0,
--                                     world.tuning.velramp_start,
--                                     world.tuning.velramp_range,
--                                     world.tuning.velramp_curvature);
-+        let ramp = if let Some(world) = self.world {
-+            velocity_ramp(
-+                self.vel.length() * 50.0,
-+                world.tuning.velramp_start,
-+                world.tuning.velramp_range,
-+                world.tuning.velramp_curvature,
-+            )
-+        } else {
-+            1.0
-+        };
-+        if ramp != 0.0 {
-             self.vel.x *= 1.0 / ramp;
-         }
-     }
--    /// Same as CCharacterCore::Quantize — write then read on local object
--    pub fn quantize(&mut self) {
--        // create temporary network object
--        let mut tmp = NetObjCharacterCore {
--            m_x: 0,
--            m_y: 0,
--            m_vel_x: 0,
--            m_vel_y: 0,
--            m_hook_state: 0,
--            m_hook_tick: 0,
--            m_hook_x: 0,
--            m_hook_y: 0,
--            m_hook_dx: 0,
--            m_hook_dy: 0,
--            m_hooked_player: 0,
--            m_jumped: 0,
--            m_direction: 0,
--            m_angle: 0,
--        };
- 
--        // serialize current state
--        self.write_netobj(&mut tmp);
--        // read it back to truncate/quantize floats
--        self.read_netobj(&tmp);
 -    }
--}
-+    fn update_hook(&mut self) {
 +        if self.hook_state == HOOK_IDLE {
 +            self.hooked_player = -1;
 +            self.hook_pos = self.pos;
-+            return;
-+        }
- 
--pub fn saturated_add(min: f32, max: f32, current: f32, add: f32) -> f32 {
--    (current + add).clamp(min, max)
--}
-+        if self.hook_state >= HOOK_RETRACT_START && self.hook_state < HOOK_RETRACT_END {
++        } else if self.hook_state >= HOOK_RETRACT_START && self.hook_state < HOOK_RETRACT_END {
 +            self.hook_state += 1;
-+            return;
-+        }
- 
--// convert float -> rounded int
--fn round_to_int(f: f32) -> i32 {
--    f.round() as i32
--}
-+        if self.hook_state == HOOK_RETRACT_END {
++        } else if self.hook_state == HOOK_RETRACT_END {
 +            self.hook_state = HOOK_RETRACTED;
-+            return;
-+        }
++        } else if self.hook_state == HOOK_FLYING {
++            let mut new_pos = self.hook_pos + self.hook_dir * world.tuning.hook_fire_speed;
  
--pub fn velocity_ramp(value: f32, start: f32, range: f32, curvature: f32) -> f32 {
--    if value < start {
--        1.0
--    } else if value > start + range {
--        1.0 + curvature
--    } else {
--        1.0 + curvature * ((value - start) / range)
-+        let (hook_fire_speed, hook_length, hook_drag_accel, hook_drag_speed) =
-+            if let Some(world) = self.world {
-+                (
-+                    world.tuning.hook_fire_speed,
-+                    world.tuning.hook_length,
-+                    world.tuning.hook_drag_accel,
-+                    world.tuning.hook_drag_speed,
-+                )
-+            } else {
-+                return;
-+            };
-+
-+        if self.hook_state == HOOK_FLYING {
-+            let mut new_pos = self.hook_pos + self.hook_dir * hook_fire_speed;
-+
-+            if self.pos.distance(&new_pos) > hook_length {
+-    pub fn move_core(&mut self) {
+-        if self.world.is_none() || self.collision.is_none() {
+-            return;
+-        }
++            if (self.pos - new_pos).length() > world.tuning.hook_length {
 +                self.hook_state = HOOK_RETRACT_START;
-+                new_pos = self.pos + (new_pos - self.pos).normalize() * hook_length;
++                new_pos = self.pos + (new_pos - self.pos).normalize() * world.tuning.hook_length;
 +            }
-+
-+            if let Some(collision) = self.collision {
-+                let (hit_ground, hit_nohook, clipped) =
-+                    collision.intersect_line(self.hook_pos, new_pos);
-+
-+                if self.hook_state == HOOK_FLYING {
-+                    if hit_ground {
-+                        self.triggered_events |= COREEVENTFLAG_HOOK_ATTACH_GROUND;
-+                        self.hook_state = HOOK_GRABBED;
-+                    } else if hit_nohook {
-+                        self.triggered_events |= COREEVENTFLAG_HOOK_HIT_NOHOOK;
-+                        self.hook_state = HOOK_RETRACT_START;
+ 
+-        let ramp = if let Some(world) = self.world {
+-            velocity_ramp(
+-                self.vel.length() * 50.0,
+-                world.tuning.velramp_start,
+-                world.tuning.velramp_range,
+-                world.tuning.velramp_curvature,
+-            )
+-        } else {
+-            1.0
+-        };
+-        self.vel.x *= ramp;
++            // Tile collision check
++            let mut going_to_hit_ground = false;
++            let mut going_to_retract = false;
++            let (hit_ground, hit_nohook, clipped_pos) = collision.intersect_line(self.hook_pos, new_pos);
++            new_pos = clipped_pos;
++            if hit_ground {
++                going_to_hit_ground = true;
++            } else if hit_nohook {
++                going_to_retract = true;
++            }
+ 
+-        if let Some(collision) = self.collision {
+-            let mut new_pos = self.pos;
+-            collision.move_box(
+-                &mut new_pos,
+-                &mut self.vel,
+-                Vec2 { x: PHYS_SIZE, y: PHYS_SIZE },
+-                0.0,
+-                Some(&mut self.death),
+-            );
+-            self.pos = new_pos;
+-        }
++            // Player check has priority over tile collision
++            if world.tuning.player_hooking {
++                let mut best_dist = f32::MAX;
++                unsafe {
++                    for i in 0..MAX_CLIENTS {
++                        let pchar = world.ap_characters[i];
++                        if pchar.is_null() || pchar == self as *mut _ {
++                            continue;
++                        }
++                        let pchar_ref = &*pchar;
++                        let closest = closest_point_on_line(self.hook_pos, new_pos, pchar_ref.pos);
++                        if (pchar_ref.pos - closest).length() < PHYS_SIZE + 2.0 {
++                            let dist = (self.hook_pos - pchar_ref.pos).length();
++                            if self.hooked_player == -1 || dist < best_dist {
++                                self.triggered_events |= COREEVENTFLAG_HOOK_ATTACH_PLAYER;
++                                self.hook_state = HOOK_GRABBED;
++                                self.hooked_player = i as i32;
++                                best_dist = dist;
++                            }
++                        }
 +                    }
-+                    self.hook_pos = clipped;
 +                }
-+            } else {
++            }
+ 
+-        let ramp = if let Some(world) = self.world {
+-            velocity_ramp(
+-                self.vel.length() * 50.0,
+-                world.tuning.velramp_start,
+-                world.tuning.velramp_range,
+-                world.tuning.velramp_curvature,
+-            )
+-        } else {
+-            1.0
+-        };
+-        if ramp != 0.0 {
+-            self.vel.x *= 1.0 / ramp;
++            // Ground/nohook check only if still flying after player check
++            if self.hook_state == HOOK_FLYING {
++                if going_to_hit_ground {
++                    self.triggered_events |= COREEVENTFLAG_HOOK_ATTACH_GROUND;
++                    self.hook_state = HOOK_GRABBED;
++                } else if going_to_retract {
++                    self.triggered_events |= COREEVENTFLAG_HOOK_HIT_NOHOOK;
++                    self.hook_state = HOOK_RETRACT_START;
++                }
 +                self.hook_pos = new_pos;
 +            }
-+        } else if self.hook_state == HOOK_GRABBED && self.hooked_player == -1 {
-+            let diff = self.hook_pos - self.pos;
-+            let dist = diff.length();
-+
-+            if dist > 46.0 {
-+                let dir = diff.normalize();
-+                self.hook_drag_vel = self.hook_drag_vel + dir * hook_drag_accel;
-+                let len = self.hook_drag_vel.length();
-+                if len > hook_drag_speed {
-+                    self.hook_drag_vel = self.hook_drag_vel * (hook_drag_speed / len);
+         }
+-    }
+ 
+-    fn update_hook(&mut self) {
+-        if self.hook_state == HOOK_IDLE {
+-            self.hooked_player = -1;
+-            self.hook_pos = self.pos;
+-            return;
++        if self.hook_state == HOOK_GRABBED {
++            if self.hooked_player != -1 {
++                unsafe {
++                    let pchar = world.ap_characters[self.hooked_player as usize];
++                    if !pchar.is_null() {
++                        // Track hooked player's position
++                        self.hook_pos = (*pchar).pos;
++                    } else {
++                        // Hooked player disappeared — release
++                        self.hooked_player = -1;
++                        self.hook_state = HOOK_RETRACTED;
++                        self.hook_pos = self.pos;
++                    }
 +                }
 +            }
 +
-+            self.hook_tick += 1;
-+            if self.hook_tick > SERVER_TICK_SPEED + SERVER_TICK_SPEED / 5 || dist < 46.0 {
-+                self.hook_drag_vel = Vec2::zero();
-+                self.hook_state = HOOK_RETRACTED;
-+                self.hook_pos = self.pos;
++            // Ground hook drag — only when not hooked to a player
++            if self.hooked_player == -1 && (self.hook_pos - self.pos).length() > 46.0 {
++                let mut hook_vel = (self.hook_pos - self.pos).normalize() * world.tuning.hook_drag_accel;
++
++                // Upward pull is stronger (easier to climb platforms)
++                if hook_vel.y > 0.0 {
++                    hook_vel.y *= 0.3;
++                }
++                // Boost horizontal pull when moving in that direction, dampen otherwise
++                if (hook_vel.x < 0.0 && self.direction < 0) || (hook_vel.x > 0.0 && self.direction > 0) {
++                    hook_vel.x *= 0.95;
++                } else {
++                    hook_vel.x *= 0.75;
++                }
++
++                let new_vel = self.vel + hook_vel;
++                // Only apply if it doesn't exceed drag speed limit OR is decelerating
++                if new_vel.length() < world.tuning.hook_drag_speed || new_vel.length() < self.vel.length() {
++                    self.vel = new_vel;
++                }
 +            }
-+        }
-     }
--}
-\ No newline at end of file
-+}
-diff --git a/src/rust_core/src/character_core/helpers.rs b/src/rust_core/src/character_core/helpers.rs
-new file mode 100644
-index 00000000..a03ebf07
---- /dev/null
-+++ b/src/rust_core/src/character_core/helpers.rs
-@@ -0,0 +1,13 @@
-+pub fn round_to_int(f: f32) -> i32 {
-+    f.round() as i32
-+}
 +
-+pub fn velocity_ramp(value: f32, start: f32, range: f32, curvature: f32) -> f32 {
-+    if value < start {
-+        1.0
-+    } else if value > start + range {
-+        1.0 + curvature
-+    } else {
-+        1.0 + curvature * ((value - start) / range)
-+    }
-+}
-diff --git a/src/rust_core/src/character_core/mod.rs b/src/rust_core/src/character_core/mod.rs
-index f2049611..19bdb27a 100644
---- a/src/rust_core/src/character_core/mod.rs
-+++ b/src/rust_core/src/character_core/mod.rs
-@@ -1 +1,6 @@
--pub mod character_core;
-\ No newline at end of file
-+pub mod constants;
-+mod helpers;
-+pub mod core;
-+
-+pub use constants::*;
-+pub use core::CharacterCore;
-diff --git a/src/rust_core/src/collision.rs b/src/rust_core/src/collision.rs
-index a1a87469..49f469d9 100644
---- a/src/rust_core/src/collision.rs
-+++ b/src/rust_core/src/collision.rs
-@@ -1,19 +1,44 @@
- use crate::vec2::Vec2;
- 
--// src/collision.rs
-+pub const COLFLAG_SOLID: i32 = 1;
-+pub const COLFLAG_DEATH: i32 = 2;
-+pub const COLFLAG_NOHOOK: i32 = 4;
-+
- #[derive(Debug)]
- pub struct Collision {
--    // các field tạm
-+    // tile map data will go here
- }
- 
- impl Collision {
-+    pub fn new() -> Self {
-+        Self {}
-+    }
-+
-+    pub fn check_point(&self, _x: f32, _y: f32) -> bool {
-+        false
-+    }
-+
-+    pub fn check_point_flag(&self, _x: f32, _y: f32, _flag: i32) -> bool {
-+        false
-+    }
-+
-+    /// Returns (hit_ground, hit_nohook, new_end_pos).
-+    /// Stub: always returns no hit.
-+    pub fn intersect_line(&self, _p0: Vec2, p1: Vec2) -> (bool, bool, Vec2) {
-+        (false, false, p1)
-+    }
-+
-+    pub fn test_box(&self, _pos: Vec2, _size: Vec2, _col_flags: i32) -> bool {
-+        false
-+    }
-+
-     pub fn move_box(
-         &self,
-         inout_pos: &mut Vec2,
-         inout_vel: &mut Vec2,
-         size: Vec2,
-         elasticity: f32,
--        mut death: Option<&mut bool>, // <- mutable ở đây
-+        mut death: Option<&mut bool>,
-     ) {
-         let mut pos = *inout_pos;
-         let mut vel = *inout_vel;
-@@ -22,7 +47,7 @@ impl Collision {
-         let max_steps = distance as i32;
- 
-         if let Some(d) = death.as_mut() {
--            *d = false;
-+            **d = false;
++            // Timeout for player hooks (1.25 seconds)
++            self.hook_tick += 1;
++            if self.hooked_player != -1 {
++                let still_alive = !world.ap_characters[self.hooked_player as usize].is_null();
++                if self.hook_tick > SERVER_TICK_SPEED + SERVER_TICK_SPEED / 5 || !still_alive {
++                    self.hooked_player = -1;
++                    self.hook_state = HOOK_RETRACTED;
++                    self.hook_pos = self.pos;
++                }
++            }
          }
  
-         if distance > 0.00001 {
-@@ -35,7 +60,7 @@ impl Collision {
- 
-                 if let Some(d) = death.as_mut() {
-                     if self.test_box(new_pos, size * (2.0 / 3.0), COLFLAG_DEATH) {
--                        *d = true;
-+                        **d = true;
-                     }
-                 }
- 
-@@ -69,13 +94,4 @@ impl Collision {
-         *inout_pos = pos;
-         *inout_vel = vel;
-     }
--
--    // Thêm stub cho test_box
--    fn test_box(&self, _pos: Vec2, _size: Vec2, _col_flags: i32) -> bool {
--        // logic collision thực tế sẽ được implement sau
--        false
--    }
- }
--
--// Constants tương ứng với C++ code
--const COLFLAG_DEATH: i32 = 1;
-\ No newline at end of file
-diff --git a/src/rust_core/src/lib.rs b/src/rust_core/src/lib.rs
-index 35ddf6f1..8bfba50d 100644
---- a/src/rust_core/src/lib.rs
-+++ b/src/rust_core/src/lib.rs
-@@ -3,4 +3,4 @@ pub mod world_core;
- pub mod collision;
- pub mod netobj;
- pub mod character_core;
--mod vec2;
-+pub mod vec2;
-diff --git a/src/rust_core/src/netobj.rs b/src/rust_core/src/netobj.rs
-index c2ab2256..b0b8f921 100644
---- a/src/rust_core/src/netobj.rs
-+++ b/src/rust_core/src/netobj.rs
-@@ -1,14 +1,12 @@
--// src/netobj.rs
-+use crate::vec2::Vec2;
- 
- #[repr(C)]
- #[derive(Debug, Clone, Copy)]
- pub struct NetObjCharacterCore {
-     pub m_x: i32,
-     pub m_y: i32,
--
-     pub m_vel_x: i32,
-     pub m_vel_y: i32,
--
-     pub m_hook_state: i32,
-     pub m_hook_tick: i32,
-     pub m_hook_x: i32,
-@@ -16,7 +14,6 @@ pub struct NetObjCharacterCore {
-     pub m_hook_dx: i32,
-     pub m_hook_dy: i32,
-     pub m_hooked_player: i32,
--
-     pub m_jumped: i32,
-     pub m_direction: i32,
-     pub m_angle: i32,
-@@ -24,9 +21,17 @@ pub struct NetObjCharacterCore {
- 
- #[derive(Debug, Default, Clone, Copy)]
- pub struct PlayerInput {
--    pub m_TargetX: i32,
--    pub m_TargetY: i32,
--    pub m_Direction: i32,
--    pub m_Jump: bool,
--    pub m_Hook: bool,
--}
-\ No newline at end of file
-+    pub target_x: i32,
-+    pub target_y: i32,
-+    pub direction: i32,
-+    pub jump: bool,
-+    pub hook: bool,
-+}
+-        if self.hook_state >= HOOK_RETRACT_START && self.hook_state < HOOK_RETRACT_END {
+-            self.hook_state += 1;
+-            return;
++        // ---- Player-player collision and hook drag (mirrors C++ Tick loop) ----
++        unsafe {
++            for i in 0..MAX_CLIENTS {
++                let pchar = world.ap_characters[i];
++                if pchar.is_null() || pchar == self as *mut _ {
++                    continue;
++                }
++                let pchar_ref = &mut *pchar;
 +
-+impl PlayerInput {
-+    pub fn get_target_direction(&self) -> Vec2 {
-+        let v = Vec2 { x: self.target_x as f32, y: self.target_y as f32 };
-+        let len = v.length();
-+        if len > 0.0001 { v * (1.0 / len) } else { Vec2 { x: 0.0, y: -1.0 } }
++                let dist = (self.pos - pchar_ref.pos).length();
++                let dir = (self.pos - pchar_ref.pos).normalize();
++
++                // Push characters apart when overlapping
++                if world.tuning.player_collision && dist < PHYS_SIZE * 1.25 && dist > 0.0 {
++                    let overlap = PHYS_SIZE * 1.45 - dist;
++                    let velocity = if self.vel.length() > 0.0001 {
++                        1.0 - (dot(self.vel.normalize(), dir) + 1.0) / 2.0
++                    } else {
++                        0.5
++                    };
++                    self.vel = self.vel + dir * overlap * (velocity * 0.75);
++                    self.vel = self.vel * 0.85;
++                }
++
++                // Apply hook drag forces between hooker and hooked player
++                if self.hooked_player == i as i32 && world.tuning.player_hooking {
++                    if dist > PHYS_SIZE * 1.5 {
++                        let accel = world.tuning.hook_drag_accel * (dist / world.tuning.hook_length);
++                        // Pull hooked player toward hooker
++                        pchar_ref.hook_drag_vel = pchar_ref.hook_drag_vel + dir * accel * 1.5;
++                        // Small counter-force on the hooker
++                        self.hook_drag_vel = self.hook_drag_vel - dir * accel * 0.25;
++                    }
++                }
++            }
+         }
+ 
+-        if self.hook_state == HOOK_RETRACT_END {
+-            self.hook_state = HOOK_RETRACTED;
+-            return;
++        // Clamp velocity
++        if self.vel.length() > 6000.0 {
++            self.vel = self.vel.normalize() * 6000.0;
+         }
++    }
+ 
+-        let (hook_fire_speed, hook_length, hook_drag_accel, hook_drag_speed) =
+-            if let Some(world) = self.world {
+-                (
+-                    world.tuning.hook_fire_speed,
+-                    world.tuning.hook_length,
+-                    world.tuning.hook_drag_accel,
+-                    world.tuning.hook_drag_speed,
+-                )
+-            } else {
+-                return;
+-            };
++    /// Mirrors C++ CCharacterCore::Move().
++    pub fn move_core(&mut self) {
++        let world = match unsafe { self.world.as_ref() } {
++            Some(w) => w,
++            None => return,
++        };
++        let collision = match unsafe { self.collision.as_ref() } {
++            Some(c) => c,
++            None => return,
++        };
+ 
+-        if self.hook_state == HOOK_FLYING {
+-            let mut new_pos = self.hook_pos + self.hook_dir * hook_fire_speed;
++        let ramp = velocity_ramp(
++            self.vel.length() * 50.0,
++            world.tuning.velramp_start,
++            world.tuning.velramp_range,
++            world.tuning.velramp_curvature,
++        );
++        self.vel.x *= ramp;
+ 
+-            if self.pos.distance(&new_pos) > hook_length {
+-                self.hook_state = HOOK_RETRACT_START;
+-                new_pos = self.pos + (new_pos - self.pos).normalize() * hook_length;
+-            }
++        let mut new_pos = self.pos;
++        collision.move_box(
++            &mut new_pos,
++            &mut self.vel,
++            Vec2 { x: PHYS_SIZE, y: PHYS_SIZE },
++            0.0,
++            Some(&mut self.death),
++        );
+ 
+-            if let Some(collision) = self.collision {
+-                let (hit_ground, hit_nohook, clipped) =
+-                    collision.intersect_line(self.hook_pos, new_pos);
+-
+-                if self.hook_state == HOOK_FLYING {
+-                    if hit_ground {
+-                        self.triggered_events |= COREEVENTFLAG_HOOK_ATTACH_GROUND;
+-                        self.hook_state = HOOK_GRABBED;
+-                    } else if hit_nohook {
+-                        self.triggered_events |= COREEVENTFLAG_HOOK_HIT_NOHOOK;
+-                        self.hook_state = HOOK_RETRACT_START;
++        if ramp != 0.0 {
++            self.vel.x *= 1.0 / ramp;
++        }
++
++        if world.tuning.player_collision {
++            let dist = (self.pos - new_pos).length();
++            let end = dist as i32 + 1;
++            let mut last_pos = self.pos;
++            let mut collision_found = false;
++            let mut collision_pos = self.pos; // default: stay in place on early return
++
++            'outer: for i in 0..end {
++                let a = if dist > 0.0 { i as f32 / dist } else { 0.0 };
++                let pos = mix(self.pos, new_pos, a);
++
++                unsafe {
++                    for p in 0..MAX_CLIENTS {
++                        let pchar = world.ap_characters[p];
++                        if pchar.is_null() || pchar == self as *mut _ {
++                            continue;
++                        }
++                        let pchar_ref = &*pchar;
++                        let d = (pos - pchar_ref.pos).length();
++                        if d < PHYS_SIZE && d >= 0.0 {
++                            collision_found = true;
++                            if a > 0.0 {
++                                collision_pos = last_pos;
++                            } else if (new_pos - pchar_ref.pos).length() > d {
++                                collision_pos = new_pos;
++                            }
++                            // else: neither condition — pos stays as self.pos (no move)
++                            break 'outer;
++                        }
+                     }
+-                    self.hook_pos = clipped;
+-                }
+-            } else {
+-                self.hook_pos = new_pos;
+-            }
+-        } else if self.hook_state == HOOK_GRABBED && self.hooked_player == -1 {
+-            let diff = self.hook_pos - self.pos;
+-            let dist = diff.length();
+-
+-            if dist > 46.0 {
+-                let dir = diff.normalize();
+-                self.hook_drag_vel = self.hook_drag_vel + dir * hook_drag_accel;
+-                let len = self.hook_drag_vel.length();
+-                if len > hook_drag_speed {
+-                    self.hook_drag_vel = self.hook_drag_vel * (hook_drag_speed / len);
+                 }
++                last_pos = pos;
+             }
+ 
+-            self.hook_tick += 1;
+-            if self.hook_tick > SERVER_TICK_SPEED + SERVER_TICK_SPEED / 5 || dist < 46.0 {
+-                self.hook_drag_vel = Vec2::zero();
+-                self.hook_state = HOOK_RETRACTED;
+-                self.hook_pos = self.pos;
++            if collision_found {
++                self.pos = collision_pos;
++                return;
+             }
+         }
++
++        self.pos = new_pos;
+     }
+ }
+diff --git a/src/rust_core/src/character_core/helpers.rs b/src/rust_core/src/character_core/helpers.rs
+index a03ebf07..ea23bfc1 100644
+--- a/src/rust_core/src/character_core/helpers.rs
++++ b/src/rust_core/src/character_core/helpers.rs
+@@ -1,13 +1,35 @@
++use crate::vec2::Vec2;
++
+ pub fn round_to_int(f: f32) -> i32 {
+     f.round() as i32
+ }
+ 
++/// Mirrors C++ VelocityRamp: returns 1/curvature^((value-start)/range)
+ pub fn velocity_ramp(value: f32, start: f32, range: f32, curvature: f32) -> f32 {
+     if value < start {
+         1.0
+-    } else if value > start + range {
+-        1.0 + curvature
+     } else {
+-        1.0 + curvature * ((value - start) / range)
++        1.0 / curvature.powf((value - start) / range)
 +    }
 +}
++
++pub fn dot(a: Vec2, b: Vec2) -> f32 {
++    a.x * b.x + a.y * b.y
++}
++
++pub fn mix(a: Vec2, b: Vec2, t: f32) -> Vec2 {
++    a + (b - a) * t
++}
++
++/// Closest point on infinite line through AB to target point P.
++/// Mirrors C++ closest_point_on_line from math.h.
++pub fn closest_point_on_line(line_a: Vec2, line_b: Vec2, target: Vec2) -> Vec2 {
++    let ab = line_b - line_a;
++    let ab_len_sq = ab.x * ab.x + ab.y * ab.y;
++    if ab_len_sq < 0.0001 {
++        return line_a;
+     }
++    let ap = target - line_a;
++    let t = (ap.x * ab.x + ap.y * ab.y) / ab_len_sq;
++    line_a + ab * t
+ }
 diff --git a/src/rust_core/src/world_core.rs b/src/rust_core/src/world_core.rs
-index e1f6739d..e80c232e 100644
+index e80c232e..59c52833 100644
 --- a/src/rust_core/src/world_core.rs
 +++ b/src/rust_core/src/world_core.rs
-@@ -1,6 +1,5 @@
- // src/world_core.rs
- 
--use crate::vec2;
+@@ -1,5 +1,5 @@
+-// src/world_core.rs
+-
++use crate::character_core::CharacterCore;
++use crate::character_core::MAX_CLIENTS;
  
  #[derive(Debug, Clone, Copy)]
  pub struct Tuning {
+@@ -16,6 +16,7 @@ pub struct Tuning {
+     pub hook_drag_accel: f32,
+     pub hook_drag_speed: f32,
+     pub hook_length: f32,
++    pub player_collision: bool,
+     pub player_hooking: bool,
+     pub velramp_start: f32,
+     pub velramp_range: f32,
+@@ -29,41 +30,46 @@ impl Default for Tuning {
+     fn default() -> Self {
+         Self {
+             gravity: 0.5,
+-            ground_control_speed: 1.0,
+-            ground_control_accel: 0.8,
+-            ground_friction: 0.7,
+-            air_control_speed: 0.6,
+-            air_control_accel: 0.5,
+-            air_friction: 0.98,
+-            ground_jump_impulse: 10.0,
+-            air_jump_impulse: 8.0,
+-            hook_fire_speed: 20.0,
+-            hook_drag_accel: 2.0,
+-            hook_drag_speed: 12.0,
+-            hook_length: 200.0,
++            ground_control_speed: 10.0,
++            ground_control_accel: 100.0 / 50.0,
++            ground_friction: 0.5,
++            air_control_speed: 8.0,
++            air_control_accel: 250.0 / 50.0 / 50.0,
++            air_friction: 0.95,
++            ground_jump_impulse: 13.2,
++            air_jump_impulse: 12.0,
++            hook_fire_speed: 80.0,
++            hook_drag_accel: 3.0,
++            hook_drag_speed: 15.0,
++            hook_length: 380.0,
++            player_collision: true,
+             player_hooking: true,
+-            velramp_start: 100.0,
+-            velramp_range: 200.0,
+-            velramp_curvature: 1.2,
+-            shotgun_speeddiff: 0.9,
+-            shotgun_lifetime: 1.5,
+-            laser_reach: 300.0,
++            velramp_start: 550.0,
++            velramp_range: 2000.0,
++            velramp_curvature: 1.4,
++            shotgun_speeddiff: 0.8,
++            shotgun_lifetime: 2.0,
++            laser_reach: 800.0,
+         }
+     }
+ }
+ 
+-#[derive(Debug)]
+ pub struct WorldCore {
+     pub tuning: Tuning,
+-    // Thêm các entity/character map nếu cần, ví dụ:
+-    pub ap_characters: [Option<*mut ()>; 64], // placeholder pointer, sau này thay bằng CharacterCore reference
++    /// Pointers to all active CharacterCores, indexed by client ID.
++    /// Null pointer means slot is empty. Mirrors C++ CWorldCore::m_apCharacters.
++    pub ap_characters: [*mut CharacterCore; MAX_CLIENTS],
+ }
+ 
++// SAFETY: WorldCore is used single-threaded in the game loop.
++unsafe impl Send for WorldCore {}
++unsafe impl Sync for WorldCore {}
++
+ impl WorldCore {
+     pub fn new() -> Self {
+         Self {
+             tuning: Tuning::default(),
+-            ap_characters: [None; 64],
++            ap_characters: [std::ptr::null_mut(); MAX_CLIENTS],
+         }
+     }
+ 
+@@ -74,6 +80,4 @@ impl WorldCore {
+     pub fn tuning_mut(&mut self) -> &mut Tuning {
+         &mut self.tuning
+     }
+-
+-    // thêm các function cần thiết về va chạm hay tìm entity ở đây
+-}
+\ No newline at end of file
++}
