@@ -46,8 +46,8 @@ impl Collision {
         let distance = vel.length();
         let max_steps = distance as i32;
 
-        if let Some(d) = death.as_mut() {
-            **d = false;
+        if let Some(d) = death.as_deref_mut() {
+            *d = false;
         }
 
         if distance > 0.00001 {
@@ -58,9 +58,9 @@ impl Collision {
                     y: pos.y + vel.y * fraction,
                 };
 
-                if let Some(d) = death.as_mut() {
+                if let Some(d) = death.as_deref_mut() {
                     if self.test_box(new_pos, size * (2.0 / 3.0), COLFLAG_DEATH) {
-                        **d = true;
+                        *d = true;
                     }
                 }
 
