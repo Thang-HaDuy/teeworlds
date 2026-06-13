@@ -1,0 +1,19 @@
+name: PR Validation
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  check-pr-description:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check issue reference
+        run: |
+          BODY=$(jq -r '.pull_request.body' "$GITHUB_EVENT_PATH")
+
+          if ! echo "$BODY" | grep -E '#[0-9]+'; then
+            echo "Missing issue reference"
+            exit 1
+          fi
