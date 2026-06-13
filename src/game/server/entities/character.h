@@ -6,6 +6,7 @@
 #include <generated/protocol.h>
 
 #include <game/gamecore.h>
+#include <game/rust_character_core.h>
 #include <game/server/entity.h>
 
 
@@ -118,13 +119,13 @@ private:
 		int m_OldVelAmount;
 	} m_Ninja;
 
-	// the player core for the physics
-	CCharacterCore m_Core;
+	// the player core for the physics (Rust-backed)
+	CCharacterCoreRust m_Core;
 
 	// info for dead reckoning
 	int m_ReckoningTick; // tick that we are performing dead reckoning From
-	CCharacterCore m_SendCore; // core that we should send
-	CCharacterCore m_ReckoningCore; // the dead reckoning core
+	CCharacterCoreRust m_SendCore; // core that we should send
+	CCharacterCoreRust m_ReckoningCore; // the dead reckoning core
 
 };
 

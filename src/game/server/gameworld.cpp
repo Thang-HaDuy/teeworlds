@@ -21,6 +21,8 @@ CGameWorld::CGameWorld()
 	m_ResetRequested = false;
 	for(int i = 0; i < NUM_ENTTYPES; i++)
 		m_apFirstEntityTypes[i] = 0;
+
+	m_pRustWorldCore = world_core_new();
 }
 
 CGameWorld::~CGameWorld()
@@ -29,6 +31,9 @@ CGameWorld::~CGameWorld()
 	for(int i = 0; i < NUM_ENTTYPES; i++)
 		while(m_apFirstEntityTypes[i])
 			delete m_apFirstEntityTypes[i];
+
+	world_core_free(m_pRustWorldCore);
+	m_pRustWorldCore = nullptr;
 }
 
 void CGameWorld::SetGameServer(CGameContext *pGameServer)

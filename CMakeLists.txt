@@ -1635,6 +1635,22 @@ else()
   set(SERVER_ICON)
 endif()
 
+# ── Rust CharacterCore ──────────────────────────────────────────────────────
+set(RUST_CORE_DIR "${CMAKE_SOURCE_DIR}/src/rust_core")
+set(RUST_CORE_LIB "${RUST_CORE_DIR}/target/release/librust_core.a")
+
+add_custom_command(
+  OUTPUT  "${RUST_CORE_LIB}"
+  COMMAND cargo build --release
+  WORKING_DIRECTORY "${RUST_CORE_DIR}"
+  COMMENT "Building Rust CharacterCore"
+  VERBATIM
+)
+add_custom_target(rust_core_build ALL DEPENDS "${RUST_CORE_LIB}")
+
+include_directories("${CMAKE_SOURCE_DIR}/src")
+# ────────────────────────────────────────────────────────────────────────────
+
 # Libraries
 set(LIBS_SERVER ${LIBS})
 
@@ -1644,10 +1660,12 @@ add_executable(${TARGET_SERVER}
   ${DEPS}
   ${SERVER_SRC}
   ${SERVER_ICON}
+  src/game/rust_character_core.cpp
   $<TARGET_OBJECTS:engine-shared>
   $<TARGET_OBJECTS:game-shared>
 )
-target_link_libraries(${TARGET_SERVER} ${LIBS_SERVER})
+add_dependencies(${TARGET_SERVER} rust_core_build)
+target_link_libraries(${TARGET_SERVER} ${LIBS_SERVER} "${RUST_CORE_LIB}" dl pthread)
 list(APPEND TARGETS_OWN ${TARGET_SERVER})
 list(APPEND TARGETS_LINK ${TARGET_SERVER})
 

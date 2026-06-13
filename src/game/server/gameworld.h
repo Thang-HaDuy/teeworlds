@@ -4,6 +4,7 @@
 #define GAME_SERVER_GAMEWORLD_H
 
 #include <game/gamecore.h>
+#include <rust_core/include/rust_character_core.h>
 
 class CEntity;
 class CCharacter;
@@ -45,6 +46,7 @@ public:
 	bool m_ResetRequested;
 	bool m_Paused;
 	CWorldCore m_Core;
+	WorldCore_Opaque* m_pRustWorldCore; // shared Rust WorldCore for all characters
 
 	CGameWorld();
 	~CGameWorld();

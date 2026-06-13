@@ -67,13 +67,14 @@ bool CCharacter::Spawn(CPlayer *pPlayer, vec2 Pos)
 	m_Pos = Pos;
 
 	m_Core.Reset();
-	m_Core.Init(&GameWorld()->m_Core, GameServer()->Collision());
+	m_Core.Init(&GameWorld()->m_Core, GameServer()->Collision(),
+	            GameWorld()->m_pRustWorldCore, m_pPlayer->GetCID());
 	m_Core.m_Pos = m_Pos;
-	GameWorld()->m_Core.m_apCharacters[m_pPlayer->GetCID()] = &m_Core;
+	GameWorld()->m_Core.m_apCharacters[m_pPlayer->GetCID()] = nullptr; // unused with Rust core
 
 	m_ReckoningTick = 0;
-	mem_zero(&m_SendCore, sizeof(m_SendCore));
-	mem_zero(&m_ReckoningCore, sizeof(m_ReckoningCore));
+	m_SendCore.Reset();
+	m_ReckoningCore.Reset();
 
 	GameWorld()->InsertEntity(this);
 	m_Alive = true;
@@ -539,7 +540,7 @@ void CCharacter::Tick()
 
 void CCharacter::TickDefered()
 {
-	static const vec2 ColBox(CCharacterCore::PHYS_SIZE, CCharacterCore::PHYS_SIZE);
+	static const vec2 ColBox(CCharacterCoreRust::PHYS_SIZE, CCharacterCoreRust::PHYS_SIZE);
 	// advance the dummy
 	{
 		CWorldCore TempWorld;
