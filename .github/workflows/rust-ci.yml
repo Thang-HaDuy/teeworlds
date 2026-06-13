@@ -1,0 +1,43 @@
+name: Rust CI
+
+on:
+  push:
+    branches:
+      - rust-core
+      - feature/**
+      - infra/**
+  pull_request:
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo fmt --check
+        working-directory: src/rust_core
+
+  clippy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo clippy -- -D warnings
+        working-directory: src/rust_core
+
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo test
+        working-directory: src/rust_core

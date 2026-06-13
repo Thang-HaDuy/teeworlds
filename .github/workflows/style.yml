@@ -1,13 +1,6 @@
 name: Check style
 
-on:
-  push:
-    branches-ignore:
-      - master
-      - staging.tmp
-      - trying.tmp
-      - staging-squash-merge.tmp
-  pull_request:
+on: [workflow_call]
 
 jobs:
   check-style:
