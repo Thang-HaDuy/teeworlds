@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - run: cargo fmt --check
-        working-directory: src/rust_core
+        working-directory: rust_core
 
   clippy:
     runs-on: ubuntu-latest
@@ -29,7 +29,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - run: cargo clippy -- -D warnings
-        working-directory: src/rust_core
+        working-directory: rust_core
 
   test:
     runs-on: ubuntu-latest
@@ -40,4 +40,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - run: cargo test
-        working-directory: src/rust_core
+        working-directory: rust_core
