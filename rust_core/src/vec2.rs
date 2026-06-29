@@ -31,6 +31,16 @@ impl Vec2 {
     pub fn angle(self) -> f32 {
         self.y.atan2(self.x)
     }
+
+    pub fn dot(self, other: Vec2) -> f32 {
+        self.x * other.x + self.y * other.y
+    }
+    pub fn distance(self, other: Vec2) -> f32 {
+        (self - other).length()
+    }
+    pub fn mix(self, other: Vec2, t: f32) -> Vec2 {
+        self + (other - self) * t
+    }
 }
 
 impl Add<Vec2> for Vec2 {
@@ -80,4 +90,13 @@ impl MulAssign<f32> for Vec2 {
         self.x *= other;
         self.y *= other;
     }
+}
+
+pub fn closest_point_on_line(point: Vec2, line_start: Vec2, line_end: Vec2) -> Vec2 {
+    let c = point - line_start;
+    let v = (line_end-line_start).normalize();
+    let d = (line_start-line_end).length();
+    let t = v.dot(c) / d;
+    let tc = t.clamp(0.0, 1.0);
+    line_start.mix(line_end, tc)
 }
