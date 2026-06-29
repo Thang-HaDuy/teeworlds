@@ -1,15 +1,18 @@
+use crate::character_core::CharacterCore;
 use crate::tuning::Tuning;
 
 pub const MAX_CLIENTS: usize = 64;
 
 pub struct WorldCore {
     pub tuning: Tuning,
+    pub characters: [Option<CharacterCore>; MAX_CLIENTS],
 }
 
 impl WorldCore {
     pub fn new() -> Self {
         Self {
             tuning: Tuning::default(),
+            characters: std::array::from_fn(|_| None),
         }
     }
 }
