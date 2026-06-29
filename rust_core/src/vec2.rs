@@ -1,4 +1,4 @@
-use std::ops::{Add, Sub, Mul, AddAssign, SubAssign, MulAssign};
+use std::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vec2 {
@@ -8,7 +8,7 @@ pub struct Vec2 {
 
 impl Vec2 {
     pub fn new(x: f32, y: f32) -> Self {
-        Self{ x, y }
+        Self { x, y }
     }
     pub fn zero() -> Self {
         Self { x: 0.0, y: 0.0 }
@@ -22,10 +22,10 @@ impl Vec2 {
         if len > 0.0 {
             Self {
                 x: self.x * inv_len,
-                y: self.y * inv_len
+                y: self.y * inv_len,
             }
         } else {
-            Self::zero()    
+            Self::zero()
         }
     }
     pub fn angle(self) -> f32 {
@@ -94,8 +94,8 @@ impl MulAssign<f32> for Vec2 {
 
 pub fn closest_point_on_line(point: Vec2, line_start: Vec2, line_end: Vec2) -> Vec2 {
     let c = point - line_start;
-    let v = (line_end-line_start).normalize();
-    let d = (line_start-line_end).length();
+    let v = (line_end - line_start).normalize();
+    let d = (line_start - line_end).length();
     let t = v.dot(c) / d;
     let tc = t.clamp(0.0, 1.0);
     line_start.mix(line_end, tc)
